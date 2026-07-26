@@ -71,6 +71,6 @@ jobs:
               --title "chore(sync): merge Umbrella upstream" \
               --body "Automated weekly sync from Umbrella-IT-Group/metamcp@${upstream}.")"
           fi
-          gh pr merge "$pr" --auto --squash
+          gh pr merge "$pr" --auto --merge
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "Enabled auto-merge for sync PR #$pr." >> "$GITHUB_STEP_SUMMARY"
