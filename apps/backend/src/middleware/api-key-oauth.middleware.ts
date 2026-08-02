@@ -16,6 +16,11 @@ export interface ApiKeyAuthenticatedRequest extends express.Request {
   endpoint: DatabaseEndpoint;
   apiKeyUserId?: string;
   apiKeyUuid?: string;
+  // Acts-as identity (api_keys.acts_as_user_id, migration 0024): the
+  // better-auth user whose delegated m365 identity this key's requests
+  // exercise. Undefined for unbound keys — the m365 injection then
+  // fail-closes. Consumed ONLY by the streamable-http m365 context gate.
+  apiKeyActsAsUserId?: string;
   oauthUserId?: string; // For OAuth-authenticated requests
   authMethod?: "api_key" | "oauth"; // Track which auth method was used
 }
@@ -197,6 +202,12 @@ export const authenticateApiKey = async (
         // API key valid - perform access control and pass
         authReq.apiKeyUserId = apiKeyResult.user_id || undefined;
         authReq.apiKeyUuid = apiKeyResult.key_uuid;
+        // Admin-bound acts-as identity (migration 0024) — stamped on BOTH
+        // api-key branches so the m365 context gate sees it regardless of
+        // whether the endpoint also has OAuth enabled. Runtime pairing
+        // re-check via resolveActsAsUserId: never stamped for an unscoped
+        // row.
+        authReq.apiKeyActsAsUserId = resolveActsAsUserId(apiKeyResult);
         authReq.authMethod = "api_key";
 
         const accessCheckResult = checkApiKeyAccess(apiKeyResult, endpoint);
@@ -267,6 +278,12 @@ export const authenticateApiKey = async (
         // API key valid - perform access control and pass
         authReq.apiKeyUserId = apiKeyResult.user_id || undefined;
         authReq.apiKeyUuid = apiKeyResult.key_uuid;
+        // Admin-bound acts-as identity (migration 0024) — stamped on BOTH
+        // api-key branches so the m365 context gate sees it regardless of
+        // whether the endpoint also has OAuth enabled. Runtime pairing
+        // re-check via resolveActsAsUserId: never stamped for an unscoped
+        // row.
+        authReq.apiKeyActsAsUserId = resolveActsAsUserId(apiKeyResult);
         authReq.authMethod = "api_key";
 
         const accessCheckResult = checkApiKeyAccess(apiKeyResult, endpoint);
@@ -367,12 +384,72 @@ export const authenticateApiKey = async (
 };
 
 /**
- * Check if API key has access to the endpoint
+ * Runtime re-check of the identity-requires-scope pairing (migration 0024):
+ * an acts-as identity is honored ONLY on a row that also carries a single-
+ * endpoint scope. Mint-time enforcement (zod + impl) cannot reach rows
+ * written outside the app — psql / admin_cli is a routine ops path here, and
+ * migration 0024's CHECK constraint could be dropped or predate a row — so
+ * without this gate an unscoped-but-bound row would become a GATEWAY-WIDE
+ * identity key honored by the streamable-http m365 context gate on every
+ * endpoint the key reaches. Fail-closed: no scope → no identity, the key
+ * still authenticates but injection stays inert.
+ *
+ * Exported for unit tests (api-key-access.test.ts); production callers are
+ * the two authenticateApiKey branches above.
  */
-function checkApiKeyAccess(
-  validation: { user_id?: string | null },
+export function resolveActsAsUserId(validation: {
+  endpoint_uuid?: string | null;
+  acts_as_user_id?: string | null;
+}): string | undefined {
+  if (
+    validation.endpoint_uuid === null ||
+    validation.endpoint_uuid === undefined
+  ) {
+    return undefined;
+  }
+  return validation.acts_as_user_id || undefined;
+}
+
+/**
+ * Check if API key has access to the endpoint.
+ *
+ * Scope semantics (migration 0023):
+ * - validation.endpoint_uuid non-NULL — the key is scoped to exactly ONE
+ *   endpoint and is denied everywhere else.
+ * - validation.endpoint_uuid NULL/undefined — legacy/unscoped (grandfathered):
+ *   reaches every enable_api_key_auth endpoint as before, UNLESS the endpoint
+ *   sets require_scoped_api_key, which opts it out of gateway-wide keys.
+ *
+ * Exported for unit tests (api-key-access.test.ts); production callers are the
+ * two authenticateApiKey branches above.
+ */
+export function checkApiKeyAccess(
+  validation: { user_id?: string | null; endpoint_uuid?: string | null },
   endpoint: DatabaseEndpoint,
 ): { allowed: boolean; message?: string } {
+  const isScopedKey =
+    validation.endpoint_uuid !== null && validation.endpoint_uuid !== undefined;
+
+  // A scoped key is valid ONLY on the endpoint it is bound to.
+  if (isScopedKey && validation.endpoint_uuid !== endpoint.uuid) {
+    return {
+      allowed: false,
+      message:
+        "This API key is scoped to a different endpoint. Use a key scoped to this endpoint, or an unscoped (gateway-wide) key.",
+    };
+  }
+
+  // An endpoint may opt out of legacy gateway-wide keys entirely: when
+  // require_scoped_api_key is set, only keys explicitly scoped to THIS
+  // endpoint authenticate — unscoped (grandfathered) keys are refused.
+  if (!isScopedKey && endpoint.require_scoped_api_key) {
+    return {
+      allowed: false,
+      message:
+        "This endpoint requires an endpoint-scoped API key. Unscoped (gateway-wide) API keys are not accepted here — mint a key scoped to this endpoint.",
+    };
+  }
+
   const isPublicApiKey = validation.user_id === null;
   const isPrivateEndpoint = endpoint.user_id !== null;
 
@@ -399,7 +476,19 @@ function checkApiKeyAccess(
 }
 
 /**
- * Check if OAuth token user has access to the endpoint
+ * Check if OAuth token user has access to the endpoint.
+ *
+ * Scope note (migration 0023): `endpoint.require_scoped_api_key` is
+ * DELIBERATELY not consulted here. That toggle governs API KEYS only —
+ * it refuses grandfathered gateway-wide *keys* on a sensitive endpoint.
+ * OAuth consumers are authenticated humans identified by their better-auth
+ * user id, not bearer secrets that could be over-broadly scoped; access is
+ * already gated by endpoint ownership below (public endpoints: any
+ * authenticated user; private endpoints: the owner only), and delegated
+ * identity injection (m365) acts strictly as that user. There is no
+ * "unscoped OAuth token" to refuse, so applying the API-key-only flag to
+ * OAuth would be a category error. The flag's UI copy and the tRPC field
+ * comment state this API-key-only limit explicitly.
  */
 function checkOAuthAccess(
   oauthResult: { user_id?: string; scopes?: string[] },
