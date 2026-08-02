@@ -3,6 +3,7 @@
   "description": "Manage your API keys for programmatic access",
   "createApiKey": "Create API Key",
   "createApiKeyDescription": "Create a new API key to access the MetaMCP API programmatically",
+  "createAdminOnly": "Only administrators can create API keys.",
   "name": "Name",
   "namePlaceholder": "e.g., Production API Key",
   "ownership": "Ownership",
@@ -33,5 +34,16 @@
   "ownershipDescription": "Private API keys are only visible to you. Public API keys can be used by anyone.",
   "hideApiKey": "Hide API key",
   "showApiKey": "Show API key",
-  "copyFullApiKey": "Copy full API key"
+  "copyFullApiKey": "Copy full API key",
+  "scope": "Scope",
+  "selectEndpoint": "Select an endpoint",
+  "allEndpoints": "All endpoints (Global — admin)",
+  "allEndpointsBadge": "All endpoints",
+  "scopeDescription": "The key will only authenticate on the selected endpoint. \"All endpoints\" mints a gateway-wide key and is restricted to administrators.",
+  "actsAsUser": "Acts as user (M365 identity)",
+  "actsAsUserPlaceholder": "better-auth user id — leave empty for no identity",
+  "actsAsUserDescription": "Optional, administrators only. Requests authenticated by this key run delegated M365 calls as this user. Requires a specific endpoint scope, and the key must be owned by this same user — never available on public ('everyone') keys. Without a binding the key stays fail-closed (no delegated identity).",
+  "actsAsBadge": "Acts as",
+  "roleLoadError": "Couldn't determine your permissions.",
+  "retryRoleLoad": "Retry"
 }

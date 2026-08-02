@@ -1,5 +1,6 @@
 import { ApiKeyCreateInput, ApiKeyUpdateInput } from "@repo/zod-types";
 import { and, desc, eq, isNull, or } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { customAlphabet } from "nanoid";
 
 import logger from "@/utils/logger";
@@ -29,6 +30,8 @@ export class ApiKeysRepository {
     name: string;
     key: string;
     user_id: string | null;
+    endpoint_uuid: string | null;
+    acts_as_user_id: string | null;
     created_at: Date;
   }> {
     const key = this.generateApiKey();
@@ -39,12 +42,22 @@ export class ApiKeysRepository {
         name: input.name,
         key: key,
         user_id: input.user_id,
+        // NULL = unscoped (legacy gateway-wide). The tRPC create path makes
+        // NULL an explicit admin choice (all_endpoints: true) — see
+        // api-keys.impl.ts; the repository just persists what it's given.
+        endpoint_uuid: input.endpoint_uuid ?? null,
+        // NULL = no acts-as identity (fail-closed m365 injection). The tRPC
+        // create path enforces the admin-only + requires-endpoint-scope
+        // policy; the repository just persists what it's given.
+        acts_as_user_id: input.acts_as_user_id ?? null,
         is_active: input.is_active ?? true,
       })
       .returning({
         uuid: apiKeysTable.uuid,
         name: apiKeysTable.name,
         user_id: apiKeysTable.user_id,
+        endpoint_uuid: apiKeysTable.endpoint_uuid,
+        acts_as_user_id: apiKeysTable.acts_as_user_id,
         created_at: apiKeysTable.created_at,
       });
 
@@ -66,6 +79,7 @@ export class ApiKeysRepository {
         key: apiKeysTable.key,
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
+        endpoint_uuid: apiKeysTable.endpoint_uuid,
       })
       .from(apiKeysTable)
       .where(eq(apiKeysTable.user_id, userId))
@@ -79,6 +93,10 @@ export class ApiKeysRepository {
   // non-reversible prefix — the raw secret is dropped at the serializer
   // boundary (serializeAdminApiKeyList) and never leaves the admin API.
   async findAll() {
+    // Second users join, aliased: acts_as_user_id → the acted-as user's
+    // email, so the admin view can label an identity-bound key with WHO it
+    // acts as (NULL when unbound or the user row is gone mid-cascade).
+    const actsAsUsers = alias(usersTable, "acts_as_users");
     return await db
       .select({
         uuid: apiKeysTable.uuid,
@@ -88,10 +106,14 @@ export class ApiKeysRepository {
         last_used_at: apiKeysTable.last_used_at,
         is_active: apiKeysTable.is_active,
         user_id: apiKeysTable.user_id,
+        endpoint_uuid: apiKeysTable.endpoint_uuid,
+        acts_as_user_id: apiKeysTable.acts_as_user_id,
+        acts_as_email: actsAsUsers.email,
         owner_email: usersTable.email,
       })
       .from(apiKeysTable)
       .leftJoin(usersTable, eq(apiKeysTable.user_id, usersTable.id))
+      .leftJoin(actsAsUsers, eq(apiKeysTable.acts_as_user_id, actsAsUsers.id))
       .orderBy(desc(apiKeysTable.created_at));
   }
 
@@ -105,6 +127,7 @@ export class ApiKeysRepository {
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
         user_id: apiKeysTable.user_id,
+        endpoint_uuid: apiKeysTable.endpoint_uuid,
       })
       .from(apiKeysTable)
       .where(isNull(apiKeysTable.user_id))
@@ -121,6 +144,8 @@ export class ApiKeysRepository {
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
         user_id: apiKeysTable.user_id,
+        endpoint_uuid: apiKeysTable.endpoint_uuid,
+        acts_as_user_id: apiKeysTable.acts_as_user_id,
       })
       .from(apiKeysTable)
       .where(
@@ -141,6 +166,7 @@ export class ApiKeysRepository {
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
         user_id: apiKeysTable.user_id,
+        endpoint_uuid: apiKeysTable.endpoint_uuid,
       })
       .from(apiKeysTable)
       .where(
@@ -160,6 +186,7 @@ export class ApiKeysRepository {
         created_at: apiKeysTable.created_at,
         is_active: apiKeysTable.is_active,
         user_id: apiKeysTable.user_id,
+        endpoint_uuid: apiKeysTable.endpoint_uuid,
       })
       .from(apiKeysTable)
       .where(
@@ -181,11 +208,15 @@ export class ApiKeysRepository {
     valid: boolean;
     user_id?: string | null;
     key_uuid?: string;
+    endpoint_uuid?: string | null;
+    acts_as_user_id?: string | null;
   }> {
     const [apiKey] = await db
       .select({
         uuid: apiKeysTable.uuid,
         user_id: apiKeysTable.user_id,
+        endpoint_uuid: apiKeysTable.endpoint_uuid,
+        acts_as_user_id: apiKeysTable.acts_as_user_id,
         is_active: apiKeysTable.is_active,
         last_used_at: apiKeysTable.last_used_at,
       })
@@ -214,6 +245,13 @@ export class ApiKeysRepository {
       valid: true,
       user_id: apiKey.user_id,
       key_uuid: apiKey.uuid,
+      // Scope binding for checkApiKeyAccess: non-NULL = the ONE endpoint
+      // this key may reach; NULL = legacy/unscoped (grandfathered).
+      endpoint_uuid: apiKey.endpoint_uuid,
+      // Acts-as identity for the streamable-http m365 context gate:
+      // non-NULL = the admin-bound better-auth user this key's requests run
+      // delegated m365 calls as; NULL = no identity (injection fail-closes).
+      acts_as_user_id: apiKey.acts_as_user_id,
     };
   }
 
