@@ -26,15 +26,20 @@
  *
  * (In SDK 1.16 these same fields lived directly on the Node transport;
  * 1.29 moved them one level down into `_webStandardTransport`, so the
- * hydration and its contract check reach through that wrapper.)
+ * hydration and its contract check reach through that wrapper. Re-verified
+ * unchanged against the installed 1.30.0 build during that bump: the Node
+ * wrapper still constructs `_webStandardTransport` in its own constructor,
+ * the inner transport still sets `_initialized = false` there, and still
+ * assigns `this.sessionId` / `this._initialized = true` only in the
+ * initialize branch that `validateSession` gates on.)
  *
  * The Anthropic claude.ai MCP connector relays that 400 as
  * `-32600 "Anthropic Proxy: Invalid content from server"`, wedging the
  * connector until a full client refresh (which drops the cached
  * sessionId and forces a fresh `initialize`). A `/mcp` reconnect does
  * NOT clear it — it reuses the same cached sessionId and hits the same
- * dead transport. (Root-caused on mcp-host-prod 2026-05-27: every
- * stored `mcp_sessions` row carried the current capability_hash, so the
+ * dead transport. (Root-caused against a live deployment: every stored
+ * `mcp_sessions` row carried the current capability_hash, so the
  * PR #22/#23/#24 capability machinery was never the cause — recovery was
  * "succeeding" and then 400-ing on the first call.)
  *
@@ -124,7 +129,7 @@ export function assertRecoveryHydrationContract(): boolean {
         "exposes `_webStandardTransport._initialized` as a boolean internal. " +
         "Lazy session recovery will refuse all recoveries until " +
         "hydrateRecoveredTransport is updated for the new SDK shape " +
-        "(currently pinned @modelcontextprotocol/sdk 1.29.0).",
+        "(currently pinned @modelcontextprotocol/sdk 1.30.0).",
     );
   }
   return ok;

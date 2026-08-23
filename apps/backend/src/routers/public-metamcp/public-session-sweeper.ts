@@ -4,11 +4,11 @@ import logger from "@/utils/logger";
  * Idle-TTL sweeper for public-endpoint (API-key / OAuth) StreamableHTTP
  * sessions.
  *
- * WHY THIS EXISTS (2026-07-14 pool-cap incident, METAMCP-POOL-1):
+ * WHY THIS EXISTS (the pool-cap outage):
  * A public endpoint session is created per API-key request stream and is
  * only torn down when the client sends an explicit `DELETE`. Most clients
- * never send it, so sessions accumulate indefinitely (prod: 241 → 1363
- * sessions in 17h). Each holds backend pool connections; once the global
+ * never send it, so under sustained load public sessions accumulate
+ * indefinitely. Each holds backend pool connections; once the global
  * backend pool reaches `MAX_TOTAL_CONNECTIONS` every new connect
  * LRU-evicts a LIVE connection, surfacing as transient
  * "Failed to re-initialize session ... after backend session loss"
@@ -41,17 +41,22 @@ import logger from "@/utils/logger";
  * re-entrancy guard, cleanup on dispose, and WARN/INFO discipline (one
  * INFO line only when a sweep actually reaps something, debug otherwise).
  *
- * Known blind spot (accepted, not fixed here): a half-open TCP connection
- * — client process died or a network path silently dropped packets
- * without FIN/RST — keeps an open standalone GET stream's `dispatchTracked`
- * call pending indefinitely from Node's perspective, so the in-flight
- * guard below never releases and the session is never reaped even though
- * no real client is listening. See the comment on `dispatchTracked` in
- * `streamable-http.ts` for the full writeup and the named follow-up
- * (SO_KEEPALIVE / an app-level SSE heartbeat).
+ * Known blind spot (NARROWED by the SDK 1.30.0 bump, not proven closed): a
+ * half-open TCP connection — client process died or a network path
+ * silently dropped packets without FIN/RST — keeps an open standalone GET
+ * stream's `dispatchTracked` call pending indefinitely from Node's
+ * perspective, so the in-flight guard below never releases and the session
+ * is never reaped even though no real client is listening. SDK 1.30.0's
+ * default 15s SSE keep-alive frames now push bytes at that dead peer, so
+ * the kernel's retransmit timeout eventually errors the socket and settles
+ * the dispatch — on the kernel's clock, not ours, and inferred from the
+ * SDK source rather than runtime-verified. See the comment on
+ * `dispatchTracked` in `streamable-http.ts` for the full writeup and the
+ * residual follow-up (SO_KEEPALIVE / a fork-side missed-heartbeat
+ * threshold).
  */
 
-// 24h default. Long-idle-but-real consumers (e.g. Hermes/Tara connecting a
+// 24h default. Long-idle-but-real consumers (e.g. an agent connecting a
 // namespace once and calling tools sporadically across a workday) must
 // survive an idle stretch; a shorter default would reap a live consumer
 // mid-day and force a reconnect. Generous by design — the cap-saturation
@@ -204,7 +209,7 @@ export class PublicSessionSweeper {
    * Seed tracking for a session at the two legitimate "this session now
    * exists in memory" moments: fresh creation and lazy recovery after a
    * reap. Unconditional by design — `touch()` / `markInFlight()` /
-   * `markSettled()` below are deliberately guarded (foreman review, PR
+   * `markSettled()` below are deliberately guarded (code review, PR
    * #72 fixes round) so a trailing call that lands after `forget()` has
    * already run (a request racing a concurrent DELETE, or a reap's own
    * teardown) can't resurrect a zombie tracking entry for a session
@@ -246,7 +251,7 @@ export class PublicSessionSweeper {
    * re-stamps activity). No-op if the session isn't tracked: a trailing
    * `markSettled` that lands after a concurrent DELETE's `forget()` has
    * already run must not resurrect the entry — the un-guarded version of
-   * this method previously did exactly that (foreman review, PR #72
+   * this method previously did exactly that (code review, PR #72
    * fixes round).
    */
   markSettled(sessionId: string): void {
@@ -294,7 +299,7 @@ export class PublicSessionSweeper {
    * Candidates are processed SEQUENTIALLY, with a recheck (still idle
    * beyond TTL AND still no in-flight request) evaluated fresh
    * immediately before each individual `reapSession` call — not just
-   * once at snapshot time (foreman review, PR #72 fixes round). The
+   * once at snapshot time (code review, PR #72 fixes round). The
    * initial scan below is a snapshot; a real request can land on any
    * not-yet-reaped candidate while an EARLIER candidate's reap is
    * awaiting real I/O (transport close, backend pool teardown), and

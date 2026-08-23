@@ -13,7 +13,13 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 // Define the MCP servers router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -23,50 +29,78 @@ export const createMcpServersRouter = (
     create: (
       input: z.infer<typeof CreateMcpServerRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof CreateMcpServerResponseSchema>>;
+    // `isAdmin` decides whether the serialized servers keep their connection
+    // URL and credential fields (env / bearerToken / headers / command /
+    // args) or come back redacted. It is threaded from `ctx.user.role` at
+    // the call site below rather than re-derived in the impl, so the RBAC
+    // source of truth stays the session role that `adminProcedure` uses.
     list: (
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof ListMcpServersResponseSchema>>;
     bulkImport: (
       input: z.infer<typeof BulkImportMcpServersRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof BulkImportMcpServersResponseSchema>>;
     get: (
       input: {
         uuid: string;
       },
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof GetMcpServerResponseSchema>>;
     delete: (
       input: {
         uuid: string;
       },
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof DeleteMcpServerResponseSchema>>;
     update: (
       input: z.infer<typeof UpdateMcpServerRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateMcpServerResponseSchema>>;
+    // `isAdmin` decides whether a PUBLIC (unowned) server may be reconnected.
+    // The impl's owner check can only compare `user_id` against the caller,
+    // and a public server has none — so ownership alone cannot answer "may
+    // this member drop every pooled connection to a shared server". Threaded
+    // from `ctx.user.role` at the call site below, the same way `list`/`get`
+    // thread theirs, rather than re-derived in the impl.
     reconnect: (
       input: z.infer<typeof ReconnectMcpServerRequestSchema>,
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof ReconnectMcpServerResponseSchema>>;
   },
 ) => {
   return router({
-    // Protected: List all MCP servers
+    // Protected (deliberate): members legitimately see the server inventory
+    // in their dashboard, so this stays protectedProcedure. The disclosure
+    // fix is redaction inside the serializer, driven by the flag below —
+    // admin-gating the whole list would blank the member UI instead.
     list: protectedProcedure
       .output(ListMcpServersResponseSchema)
       .query(async ({ ctx }) => {
-        return await implementations.list(ctx.user.id);
+        return await implementations.list(
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
 
-    // Protected: Get single MCP server by UUID
+    // Protected: Get single MCP server by UUID — same contract as `list`.
     get: protectedProcedure
       .input(z.object({ uuid: z.string() }))
       .output(GetMcpServerResponseSchema)
       .query(async ({ input, ctx }) => {
-        return await implementations.get(input, ctx.user.id);
+        return await implementations.get(
+          input,
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
 
     // Admin only: Create MCP server
@@ -74,7 +108,11 @@ export const createMcpServersRouter = (
       .input(CreateMcpServerRequestSchema)
       .output(CreateMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.create(input, ctx.user.id);
+        return await implementations.create(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Bulk import MCP servers. Gated even though the brief names
@@ -85,7 +123,11 @@ export const createMcpServersRouter = (
       .input(BulkImportMcpServersRequestSchema)
       .output(BulkImportMcpServersResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.bulkImport(input, ctx.user.id);
+        return await implementations.bulkImport(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Delete MCP server
@@ -93,7 +135,11 @@ export const createMcpServersRouter = (
       .input(z.object({ uuid: z.string() }))
       .output(DeleteMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.delete(input, ctx.user.id);
+        return await implementations.delete(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update MCP server
@@ -101,18 +147,29 @@ export const createMcpServersRouter = (
       .input(UpdateMcpServerRequestSchema)
       .output(UpdateMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.update(input, ctx.user.id);
+        return await implementations.update(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Protected (deliberate): Reconnect MCP server (drop pooled upstream
     // connection so tools re-list on next request — no gateway restart
     // required). Operational nudge, not a config mutation — do not fold into
-    // the RBAC gate above.
+    // the RBAC gate above: adminProcedure here would also take away a
+    // non-admin owner's ability to reconnect a server they own. The public
+    // (unowned) case is what needs the role, and it is decided in the impl
+    // from the flag threaded below.
     reconnect: protectedProcedure
       .input(ReconnectMcpServerRequestSchema)
       .output(ReconnectMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.reconnect(input, ctx.user.id);
+        return await implementations.reconnect(
+          input,
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
   });
 };

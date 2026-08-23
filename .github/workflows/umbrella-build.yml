@@ -14,6 +14,11 @@ on:
       - "packages/**"
       - "Dockerfile"
       - "docker-entrypoint.sh"
+      # The entrypoint shells out to scripts/, and the Dockerfile COPYs the
+      # whole directory, so a change confined to a script feeds the image
+      # like any source change. Omitted, it would leave the published image
+      # running the previous version of a script with nothing to say so.
+      - "scripts/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -35,6 +40,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # NOTE: this workflow builds, tags and releases the image. Tests and
+  # check-types run in umbrella-ci.yml, on the same push/PR-to-`umbrella`
+  # triggers. `lint` is still deliberately ungated anywhere: upstream `main`
+  # carries pre-existing eslint warnings that `--max-warnings 0` turns into a
+  # failure, and they aren't caused by our cherry-picks. Tracked as a
+  # follow-up — see UMBRELLA_FORK.md "Our own patches" backlog.
   build-and-release:
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/umbrella') ||
