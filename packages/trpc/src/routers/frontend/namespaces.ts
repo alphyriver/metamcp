@@ -19,7 +19,13 @@ import {
 } from "@repo/zod-types";
 import { z } from "zod";
 
-import { adminProcedure, protectedProcedure, router } from "../../trpc";
+import {
+  adminProcedure,
+  type AuditActor,
+  auditActor,
+  protectedProcedure,
+  router,
+} from "../../trpc";
 
 // Define the namespaces router with procedure definitions
 // The actual implementation will be provided by the backend
@@ -29,15 +35,20 @@ export const createNamespacesRouter = (
     create: (
       input: z.infer<typeof CreateNamespaceRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof CreateNamespaceResponseSchema>>;
     list: (
       userId: string,
     ) => Promise<z.infer<typeof ListNamespacesResponseSchema>>;
+    // `isAdmin`: the namespace response embeds full server objects, so it
+    // carries the same connection-URL / credential redaction contract as the
+    // mcpServers router. Threaded from `ctx.user.role` at the call site.
     get: (
       input: {
         uuid: string;
       },
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof GetNamespaceResponseSchema>>;
     getTools: (
       input: z.infer<typeof GetNamespaceToolsRequestSchema>,
@@ -48,26 +59,35 @@ export const createNamespacesRouter = (
         uuid: string;
       },
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof DeleteNamespaceResponseSchema>>;
     update: (
       input: z.infer<typeof UpdateNamespaceRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceResponseSchema>>;
     updateServerStatus: (
       input: z.infer<typeof UpdateNamespaceServerStatusRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceServerStatusResponseSchema>>;
     updateToolStatus: (
       input: z.infer<typeof UpdateNamespaceToolStatusRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceToolStatusResponseSchema>>;
     updateToolOverrides: (
       input: z.infer<typeof UpdateNamespaceToolOverridesRequestSchema>,
       userId: string,
+      actor: AuditActor,
     ) => Promise<z.infer<typeof UpdateNamespaceToolOverridesResponseSchema>>;
+    // `isAdmin` decides whether a PUBLIC (unowned) namespace may be
+    // refreshed, for the reason spelled out at the procedure below. Threaded
+    // from `ctx.user.role` at the call site, like `get`'s flag above.
     refreshTools: (
       input: z.infer<typeof RefreshNamespaceToolsRequestSchema>,
       userId: string,
+      isAdmin: boolean,
     ) => Promise<z.infer<typeof RefreshNamespaceToolsResponseSchema>>;
   },
 ) => {
@@ -84,7 +104,11 @@ export const createNamespacesRouter = (
       .input(z.object({ uuid: z.string() }))
       .output(GetNamespaceResponseSchema)
       .query(async ({ input, ctx }) => {
-        return await implementations.get(input, ctx.user.id);
+        return await implementations.get(
+          input,
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
 
     // Protected: Get tools for namespace from mapping table
@@ -100,7 +124,11 @@ export const createNamespacesRouter = (
       .input(CreateNamespaceRequestSchema)
       .output(CreateNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.create(input, ctx.user.id);
+        return await implementations.create(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Delete namespace
@@ -108,7 +136,11 @@ export const createNamespacesRouter = (
       .input(z.object({ uuid: z.string() }))
       .output(DeleteNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.delete(input, ctx.user.id);
+        return await implementations.delete(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update namespace
@@ -116,7 +148,11 @@ export const createNamespacesRouter = (
       .input(UpdateNamespaceRequestSchema)
       .output(UpdateNamespaceResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.update(input, ctx.user.id);
+        return await implementations.update(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update server status within namespace. This is namespace
@@ -127,7 +163,11 @@ export const createNamespacesRouter = (
       .input(UpdateNamespaceServerStatusRequestSchema)
       .output(UpdateNamespaceServerStatusResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.updateServerStatus(input, ctx.user.id);
+        return await implementations.updateServerStatus(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update tool status within namespace. Curation, same
@@ -136,7 +176,11 @@ export const createNamespacesRouter = (
       .input(UpdateNamespaceToolStatusRequestSchema)
       .output(UpdateNamespaceToolStatusResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.updateToolStatus(input, ctx.user.id);
+        return await implementations.updateToolStatus(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
     // Admin only: Update tool overrides within namespace. Curation, same
@@ -145,18 +189,34 @@ export const createNamespacesRouter = (
       .input(UpdateNamespaceToolOverridesRequestSchema)
       .output(UpdateNamespaceToolOverridesResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.updateToolOverrides(input, ctx.user.id);
+        return await implementations.updateToolOverrides(
+          input,
+          ctx.user.id,
+          auditActor(ctx),
+        );
       }),
 
-    // Protected (deliberate): re-lists tools over the existing pooled
-    // connection — an operational nudge, not a config mutation (it changes
-    // no row a member couldn't already read). Do not fold into the RBAC
-    // gate above.
+    // Protected (deliberate) at the PROCEDURE level so a non-admin owner can
+    // still refresh a namespace they own — but the "not a config mutation"
+    // half of the old note here was wrong, and the impl now enforces the
+    // correction. The tools in the input are caller-supplied, and the impl
+    // upserts their description and inputSchema into the shared `tools`
+    // catalog and writes ACTIVE namespace tool mappings from them, so a
+    // caller who can reach it for a namespace can rewrite what downstream
+    // MCP clients are told a tool does and re-activate mappings that
+    // `updateToolStatus` (adminProcedure) had switched off. On a PUBLIC
+    // namespace the impl's ownership test is vacuous, so the role is what
+    // has to decide it — threaded below, same shape as `reconnect` on the
+    // mcpServers router.
     refreshTools: protectedProcedure
       .input(RefreshNamespaceToolsRequestSchema)
       .output(RefreshNamespaceToolsResponseSchema)
       .mutation(async ({ input, ctx }) => {
-        return await implementations.refreshTools(input, ctx.user.id);
+        return await implementations.refreshTools(
+          input,
+          ctx.user.id,
+          ctx.user.role === "admin",
+        );
       }),
   });
 };
