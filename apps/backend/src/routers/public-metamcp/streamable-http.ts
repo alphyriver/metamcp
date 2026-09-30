@@ -21,6 +21,10 @@ import {
 import { runWithCallerContext } from "../../lib/metamcp/caller-context-store";
 import { resolveClientIdentity } from "../../lib/metamcp/consumer-identity-resolver";
 import {
+  checkConcurrentSessionCeiling,
+  registerSessionCounter,
+} from "../../lib/metamcp/credential-session-quota";
+import {
   GATEWAY_BOOT_ID,
   GATEWAY_CAPABILITY_HASH,
   shouldRefuseRecovery,
@@ -38,6 +42,7 @@ import {
   extractPresentedCredential,
   type SessionDenialReason,
 } from "../../lib/metamcp/session-binding-denial";
+import { recordSessionCeilingEvent } from "../../lib/metamcp/session-ceiling-events";
 import {
   assertRecoveryHydrationContract,
   hydrateRecoveredTransport,
@@ -264,6 +269,12 @@ const sessionManager =
   new SessionLifetimeManagerImpl<StreamableHTTPServerTransport>(
     "StreamableHTTP",
   );
+
+// Register as a source of live-session counts for the per-credential
+// concurrent-session ceiling. The ceiling sums across every registered manager
+// (this one plus the SSE manager), so a credential's session budget spans both
+// transports rather than being per-transport.
+registerSessionCounter(sessionManager);
 
 // Idle-TTL sweeper for public-endpoint sessions. This reaps on a DIFFERENT
 // axis than the age-based `sessionManager.startCleanupTimer` below: last
@@ -906,7 +917,7 @@ streamableHttpRouter.get(
   lookupEndpoint,
   authenticateApiKey,
   rateLimitMiddleware,
-  async (req, res) => {
+  async (req, res, next) => {
     // const authReq = req as ApiKeyAuthenticatedRequest;
     // const { namespaceUuid, endpointName } = authReq;
     const sessionId = req.headers["mcp-session-id"] as string;
@@ -968,7 +979,12 @@ streamableHttpRouter.get(
       await dispatchTracked(authReq, transport, req, res, sessionId);
     } catch (error) {
       logger.error("Error in public endpoint /mcp route:", error);
-      res.status(500).json(error);
+      // Defer to the terminal error handler (middleware/error-handler): it
+      // returns the constant INTERNAL_ERROR_BODY and destroys an already
+      // streaming socket. Client-facing bodies here previously serialized the
+      // raw error object (message, and on the branches below the session id
+      // and endpoint name); detail stays in the server log above.
+      return next(error);
     }
   },
 );
@@ -978,7 +994,7 @@ streamableHttpRouter.post(
   lookupEndpoint,
   authenticateApiKey,
   rateLimitMiddleware,
-  async (req, res) => {
+  async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
     const { namespaceUuid, endpointName } = authReq;
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -996,6 +1012,30 @@ streamableHttpRouter.post(
 
     if (!sessionId) {
       try {
+        // Per-credential concurrent-session ceiling, enforced at creation. A
+        // credential already holding the maximum is refused here rather than
+        // being allowed to mint another session that, once the shared backend
+        // pool saturates, would evict other consumers' live connections. The
+        // consumer's display name is threaded into the WARN and the throttled
+        // gateway event so a leaking credential is nameable from the logs and
+        // the History view, never from a database prompt.
+        const identity = resolveSessionIdentity(authReq);
+        const ceiling = checkConcurrentSessionCeiling(identity, {
+          label: clientIdentity?.name,
+        });
+        recordSessionCeilingEvent({
+          identity,
+          endpointName,
+          label: clientIdentity?.name,
+          decision: ceiling,
+        });
+        if (!ceiling.allowed) {
+          res.status(429).json({
+            error: `Too many concurrent sessions for this credential (${ceiling.current}/${ceiling.ceiling}). Close idle sessions, or ask an administrator to raise MCP_MAX_SESSIONS_PER_CREDENTIAL.`,
+          });
+          return;
+        }
+
         logger.info(
           `New public endpoint StreamableHttp connection request for ${endpointName} -> namespace ${namespaceUuid}`,
         );
@@ -1143,16 +1183,9 @@ streamableHttpRouter.post(
         );
       } catch (error) {
         logger.error("Error in public endpoint /mcp POST route:", error);
-
-        // Provide more detailed error information
-        const errorMessage =
-          error instanceof Error ? error.message : "Unknown error";
-        res.status(500).json({
-          error: "Internal server error",
-          message: errorMessage,
-          endpoint: endpointName,
-          timestamp: new Date().toISOString(),
-        });
+        // Constant body via the terminal error handler; no error message or
+        // endpoint name in the client-facing response (detail is logged above).
+        return next(error);
       }
     } else {
       // logger.info(
@@ -1272,16 +1305,9 @@ streamableHttpRouter.post(
         );
       } catch (error) {
         logger.error("Error in public endpoint /mcp route:", error);
-
-        const errorMessage =
-          error instanceof Error ? error.message : "Unknown error";
-        res.status(500).json({
-          error: "Internal server error",
-          message: errorMessage,
-          session_id: sessionId,
-          endpoint: endpointName,
-          timestamp: new Date().toISOString(),
-        });
+        // Constant body via the terminal error handler; no error message,
+        // session id or endpoint name in the client-facing response.
+        return next(error);
       }
     }
   },
@@ -1292,7 +1318,7 @@ streamableHttpRouter.delete(
   lookupEndpoint,
   authenticateApiKey,
   rateLimitMiddleware,
-  async (req, res) => {
+  async (req, res, next) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
     const { namespaceUuid, endpointName } = authReq;
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -1333,11 +1359,9 @@ streamableHttpRouter.delete(
         });
       } catch (error) {
         logger.error("Error in public endpoint /mcp DELETE route:", error);
-        res.status(500).json({
-          error: "Cleanup failed",
-          message: error instanceof Error ? error.message : "Unknown error",
-          sessionId: sessionId,
-        });
+        // Constant body via the terminal error handler; no error message or
+        // session id in the client-facing response.
+        return next(error);
       }
     } else {
       res.status(400).json({

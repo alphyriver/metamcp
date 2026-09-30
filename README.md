@@ -74,7 +74,7 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 
 ### Session survival across restarts
 
-- **Session-lost and transport-lost recovery** — detectors that recognize the many wrap shapes of a dead backend session (`-32600 "Session not found"`) or a dead transport (`"Not connected"`), walking `.cause` chains and nested envelopes, wired into every proxy call site (tools/call, dynamic-find, aggregate list handlers, and the OpenAPI bridge). Recovery invalidates the stale pooled connection and retries once, transparently.
+- **Session-lost and transport-lost recovery** — detectors that recognize the many wrap shapes of a dead backend session (`-32600 "Session not found"`) or a dead transport (`"Not connected"`), walking `.cause` chains and nested envelopes, wired into every proxy call site (tools/call, dynamic-find, aggregate list handlers, and the OpenAPI bridge). Recovery invalidates the stale pooled connection and retries once, transparently. A tool call is retried only when the failure proves the backend never ran it (an HTTP 404 "Session not found" answer, or a transport closed before the send); a timeout or a connection dropped mid-call reaches the client instead, so the gateway does not re-send a call that may already have executed.
 - **Lazy session recovery across gateway restarts** — session metadata is persisted to an `mcp_sessions` table on init (session id, namespace, endpoint, hashed auth principal, init params). After the gateway restarts with an empty in-memory pool, a returning client's cached `Mcp-Session-Id` is re-validated against the table in constant time, the transport is rebuilt, and the request is replayed — including replaying the MCP `initialize` handshake so the rebuilt transport is actually usable.
 - **`boot_id` + `capability_hash` recovery gating** — recovery is allowed only when the gateway's advertised capability set is unchanged since the session was created. A frozen capability object is both declared on the server and hashed; a matching hash means recovery is safe, a differing hash forces a clean re-init. This prevents handing a client a transport whose negotiated capabilities are stale.
 - **Auto-nuke stale sessions on capability change** — on the first boot after a capability change, rows whose `capability_hash` no longer matches are deleted in one pass, so a capability-changing deploy surfaces the client re-init path at most once instead of wedging sessions indefinitely.
@@ -180,7 +180,7 @@ Cutover order:
 
 1. Set `METAMCP_RUNTIME_DB_PASSWORD` in `.env` to a strong value.
 2. `docker compose up -d` (a recreate, not a restart — the variable has to reach the entrypoint).
-3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool. The failure shape is the same line with `rolsuper=true` and the words `remain bypassable by this credential` — that means the split did not take. It is also written to `audit_log` as `db.runtime_split.ineffective`, so it can be alerted on rather than only watched for.
+3. Confirm the boot log carries `Runtime DB role check (main pool): connected as "metamcp_runtime", rolsuper=false` and the same for the audit pool and the gateway-events pool (all three request-path pools are checked). The failure shape is the same line with `rolsuper=true` and the words `remain bypassable by this credential`, which means the split did not take. It is also written to `audit_log` as `db.runtime_split.ineffective`, so it can be alerted on rather than only watched for.
 
 The dev stack (`docker-compose.dev.yml`) runs the same step from its own entrypoint, so it honours the switch too. Both compose files read the same `.env`.
 
@@ -196,8 +196,8 @@ table created by a future migration starts out fully writable by the runtime rol
 append-only table must be added to the revoke list in `scripts/ensure-runtime-role.sh`; a test
 asserts that every table a migration protects with an immutability trigger appears there.
 
-See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the per-change record, and [`SECURITY.md`](SECURITY.md)
-to report an issue. Several of these items apply to upstream unchanged; we coordinate them privately
+See [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) for the per-change record. Report a security weakness through
+[`SECURITY.md`](SECURITY.md), and anything else through [GitHub Issues](https://github.com/Umbrella-IT-Group/metamcp/issues). Several of these items apply to upstream unchanged; we coordinate them privately
 with the upstream maintainers before any public detail.
 
 ## Where we diverged from upstream
@@ -236,7 +236,7 @@ Upstream community resources (Discord, docs, DeepWiki) live at [`metatool-ai/met
 docker pull ghcr.io/umbrella-it-group/metamcp:latest
 ```
 
-Wire it into your own `docker-compose.yml` alongside a Postgres instance. The image is amd64 and published on every push to `umbrella`.
+Wire it into your own `docker-compose.yml` alongside a Postgres instance. The image is amd64, public (no registry login needed), and published when a push to `umbrella` changes a path watched by [the build workflow](.github/workflows/umbrella-build.yml). If the pull is denied, please [open an issue](https://github.com/Umbrella-IT-Group/metamcp/issues) with the exact error text, with secrets and internal hostnames redacted.
 
 ### Build from source with Docker Compose
 
@@ -250,6 +250,8 @@ docker compose up -d
 ```
 
 Edit `.env` before that first `docker compose up`. `POSTGRES_PASSWORD` has no default in any of the compose files: leave it unset and compose stops and names it, rather than falling back to a password published in this repository. `example.env` assigns it an obvious placeholder, which is enough to get past that check but is not a password. Replace it. `BETTER_AUTH_SECRET` is required the same way and for a sharper reason: it is the session signing key, so whoever holds it can mint a session cookie for any account without a password, and its old compose default was published here too. Generate one with `openssl rand -hex 32`. Unlike `POSTGRES_PASSWORD` it has no initdb coupling, so an existing deployment can change it at any time; doing so invalidates sessions signed with the old key and signs everyone out once. Upgrading an existing deployment: Postgres reads `POSTGRES_PASSWORD` only when the data volume is first initialized, so a volume created under the old published default keeps that password until you run `ALTER USER metamcp_user WITH PASSWORD '<new>'` in the running database; set `.env` to whatever the volume actually uses, or rotate with `ALTER USER` first, otherwise the app fails Postgres authentication on next start. The other thing to edit is the bootstrap account. This fork ships **registration closed** (`BOOTSTRAP_DISABLE_REGISTRATION_UI=true`, see [Registration controls](#registration-controls)), so nobody can self-register a first administrator through the UI: the account bootstrap creates is the only way in. Out of the box that is `example.env`'s placeholder `BOOTSTRAP_USER_EMAIL` / `BOOTSTRAP_USER_PASSWORD` pair (`test@user.example` / `REPLACE_ME__generate_a_strong_password`), which is a placeholder rather than credentials you want on a running gateway. The backend warns loudly at boot if that placeholder is still the configured password, and again if `BETTER_AUTH_SECRET` is still `example.env`'s. Set `BOOTSTRAP_USERS` (a JSON array, the recommended form) or those two single-user variables to real values first.
+
+The compose files publish both ports on loopback (`127.0.0.1:12008` and `127.0.0.1:9433`) rather than every host interface, so a box with a public IP does not expose the unauthenticated app port or the raw Postgres port to the network by default. `localhost:12008` still works on the host. To reach the app from another machine, put a reverse proxy or an SSH tunnel in front of it rather than widening the bind. This matches the loopback posture the platform overlay enforces on the real deployment.
 
 If you change `APP_URL`, access the app only from that URL. MetaMCP applies CORS per route: the OAuth discovery endpoints allow any origin, while the app and API routes (`/api/auth`, `/trpc`, `/mcp-proxy`, `/metamcp`) are restricted to an allowlist of `APP_URL` plus any origins you add to `EXTRA_TRUSTED_ORIGINS` (comma-separated). The Postgres volume name is global and may collide with other Postgres containers; rename `metamcp_postgres_data` in `docker-compose.yml` if needed.
 
@@ -280,6 +282,8 @@ Both fail closed: an unset variable, or an unparseable one, reads as `true`, so 
 Bootstrap is exempt from its own lock, and it has to be. It creates the configured accounts by signing them up through the same route `DISABLE_SIGNUP` closes, and it writes that flag to the `config` table on every run, so from the second boot onward the flag is already stored `true` when bootstrap starts. With `BOOTSTRAP_RECREATE_USER=true` the administrator (and its user-scoped API keys) is deleted before the re-signup, so a refusal there would leave an ordinary restart with no administrator, registration closed, and the keys unrecoverable. Bootstrap therefore opens a signup exemption around its user pass and closes it in a `finally` immediately after. The exemption is not reachable from outside the process: all of this runs before the HTTP server starts listening, so no request can arrive while it is open, and it covers only bootstrap's own accounts, never a request. The created account is still recorded in the audit log like any other.
 
 One limit worth knowing: these controls are only asserted when bootstrap runs at all. A `BOOTSTRAP_ENABLE=false` deploy writes no row, which upstream's readers treat as open, so such a deploy keeps upstream's behaviour and has to close registration by hand in the admin UI.
+
+Admin identity is a deployment concern, not a committed one. Provision the account through `BOOTSTRAP_USERS` and let the deployment name its own administrator through configuration at boot (the private platform overlay supplies the address via `METAMCP_ADMIN_EMAIL`) rather than a literal baked into a committed migration. Two early seed migrations (`0020_users_role.sql`, `0022_promote_ci_admin.sql`) predate this and promote specific addresses by literal; they are left in place because they have already run in production and this repository's history is public, so rewriting them would change nothing an attacker cannot already read while breaking every deployed migration checksum. The `migrations-no-email-literals` backend test fails any migration written after the current head that reintroduces an address literal, so the seed identities stay a bounded, historical residual.
 
 ### Sign-in rate limiting
 
@@ -455,7 +459,7 @@ sequenceDiagram
 
 ## Contributing and upstreaming
 
-Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). PRs target `umbrella`, squash-merged after review and gates.
+Contributions welcome. Bugs and feature requests go to [GitHub Issues](https://github.com/Umbrella-IT-Group/metamcp/issues), questions to [Discussions](https://github.com/Umbrella-IT-Group/metamcp/discussions), and security reports through [`SECURITY.md`](SECURITY.md). [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development setup and the pull request flow: PRs target `umbrella` and are squash-merged after review and gates.
 
 When a patch is generic (a bug fix or config option that isn't Umbrella-specific), branch off `main`, open it against `metatool-ai/metamcp`, and once merged upstream we drop our private carry. [`UMBRELLA_FORK.md`](UMBRELLA_FORK.md) tracks the full cherry-pick log, which of our patches converged upstream, and the upstreaming backlog.
 

@@ -4,7 +4,6 @@ import {
   SSEClientTransport,
   SseError,
 } from "@modelcontextprotocol/sdk/client/sse.js";
-import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -18,15 +17,21 @@ import express from "express";
 import { findActualExecutable } from "spawn-rx";
 import { z } from "zod";
 
+import {
+  assertPublicMcpUrl,
+  createGuardedFetch,
+} from "@/lib/metamcp/url-guard";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
 import mcpProxy from "../../lib/mcp-proxy";
 import { transformDockerUrl } from "../../lib/metamcp/client";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
-import { resolveEnvVariables } from "../../lib/metamcp/utils";
+import {
+  getDefaultEnvironment,
+  resolveEnvVariables,
+} from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
-import { assertPublicMcpUrl, createGuardedFetch } from "./url-guard";
 
 // `x-mcp-actor` is best-effort, client-asserted attribution: it names who an
 // action is on behalf of so backend MCPs (shell-broker, ninja, inventory) can
@@ -233,10 +238,20 @@ const findRegisteredStdioServer = async (
  * `args` comes from the stored array rather than from a shell-parse of the
  * request's flattened string, so an argument that legitimately contains a
  * space survives instead of being split into two.
+ *
+ * The child env is the SAME curated allowlist the pool path uses
+ * (`lib/metamcp/utils` getDefaultEnvironment, applied to the server env in
+ * `convertDbServerToParams` and spawned via `lib/metamcp/client.ts`) plus this
+ * server's own resolved env, and NOT a spread of the whole gateway
+ * `process.env`. Matching that curated function rather than the SDK's shorter
+ * default keeps an Inspector-spawned server's inherited env (PATH, proxy and
+ * CA-cert variables) identical to a pool-spawned one, and stops an npx MCP an
+ * admin registers from inheriting DATABASE_URL, BETTER_AUTH_SECRET and every
+ * vendor secret. A server that genuinely needs a gateway variable still names
+ * it explicitly with a `${VAR}` placeholder, which `resolveEnvVariables` fills.
  */
 const buildStdioSpawnParams = (server: DatabaseMcpServer): StdioSpawnParams => {
   const env = {
-    ...process.env,
     ...defaultEnvironment,
     ...resolveEnvVariables(server.env || {}),
   } as Record<string, string>;
@@ -496,7 +511,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     const url = transformDockerUrl(query.url as string);
 
     // The destination is caller-supplied, so it is checked BEFORE anything is
-    // opened and before the database is asked about it — see ./url-guard. The
+    // opened and before the database is asked about it (see the url-guard module). The
     // check is by address range rather than by "is this row registered",
     // because pointing the Inspector at a not-yet-saved public server is a
     // flow that has to keep working.
@@ -578,7 +593,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
   } else if (transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP) {
     const url = transformDockerUrl(query.url as string);
 
-    // Same destination check as the SSE branch above — see ./url-guard.
+    // Same destination check as the SSE branch above (see the url-guard module).
     const target = await assertPublicMcpUrl(url);
 
     // Same caller-scoped row lookup and same in-memory error-state read as the

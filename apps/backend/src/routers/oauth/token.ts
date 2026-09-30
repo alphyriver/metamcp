@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import express from "express";
 
 import {
@@ -17,6 +18,7 @@ import {
   generateSecureAccessToken,
   generateSecureRefreshToken,
   rateLimitToken,
+  verifyClientSecret,
 } from "./utils";
 
 const tokenRouter = express.Router();
@@ -167,8 +169,19 @@ function emitTokenIssued(
 
 /**
  * Issue a new access token + refresh token pair and store them.
+ *
+ * `familyId` ties the pair into a refresh-token family (migration 0037). The
+ * authorization_code grant omits it, starting a NEW family; the refresh grant
+ * passes the rotated row's `family_id`, so a whole rotation chain shares one
+ * family and reuse of any rotated-out member can revoke the entire lineage. The
+ * id is a random uuid, unguessable, so it is never a value a caller can present.
  */
-async function issueTokenPair(clientId: string, userId: string, scope: string) {
+async function issueTokenPair(
+  clientId: string,
+  userId: string,
+  scope: string,
+  familyId: string = randomUUID(),
+) {
   const accessToken = generateSecureAccessToken();
   const refreshToken = generateSecureRefreshToken();
 
@@ -177,8 +190,15 @@ async function issueTokenPair(clientId: string, userId: string, scope: string) {
     user_id: userId,
     scope,
     expires_at: Date.now() + ACCESS_TOKEN_EXPIRY * 1000,
-    refresh_token: refreshToken,
-    refresh_token_expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+    family_id: familyId,
+    // The refresh token and its expiry travel as one pair, so a token can never
+    // be stored with a refresh token but no expiry — the never-reaped,
+    // never-expiring shape migration 0035's CHECK also forbids at the column
+    // level.
+    refresh: {
+      token: refreshToken,
+      expires_at: Date.now() + REFRESH_TOKEN_EXPIRY * 1000,
+    },
   });
 
   return { accessToken, refreshToken };
@@ -326,9 +346,17 @@ async function handleAuthorizationCodeGrant(
     ).toString();
     const [authClientId, authClientSecret] = credentials.split(":");
 
+    // The client_id half is not a secret, so a plain compare is fine; the
+    // secret half is verified against the salted hash at rest (migration 0036)
+    // in constant time (verifyClientSecret -> timingSafeEqualSecret) so the
+    // token endpoint is not a timing oracle for a confidential client's secret.
     if (
       authClientId !== client_id ||
-      authClientSecret !== clientData.client_secret
+      !verifyClientSecret(
+        authClientSecret,
+        clientData.client_secret,
+        clientData.client_secret_salt,
+      )
     ) {
       return res.status(401).json({
         error: "invalid_client",
@@ -337,7 +365,14 @@ async function handleAuthorizationCodeGrant(
     }
   } else if (clientData.token_endpoint_auth_method === "client_secret_post") {
     const { client_secret } = req.body;
-    if (!client_secret || client_secret !== clientData.client_secret) {
+    if (
+      !client_secret ||
+      !verifyClientSecret(
+        client_secret,
+        clientData.client_secret,
+        clientData.client_secret_salt,
+      )
+    ) {
       return res.status(401).json({
         error: "invalid_client",
         error_description: "Invalid client secret",
@@ -362,15 +397,19 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Verify code challenge
+  // Verify code challenge. Only S256 is honored — the "plain" method is
+  // rejected rather than verified. The AS metadata advertises S256 only, and a
+  // "plain" challenge equals the verifier and travels in the /oauth/authorize
+  // query string (logged, left in browser history), so it gives no protection
+  // against code interception. The authorize handler refuses to mint a "plain"
+  // code, so a stored one is not reachable through the normal flow; this branch
+  // is the defense-in-depth twin that refuses it here too.
   const crypto = await import("crypto");
   let challengeFromVerifier: string;
 
   if (codeData.code_challenge_method === "S256") {
     const hash = crypto.createHash("sha256").update(code_verifier).digest();
     challengeFromVerifier = hash.toString("base64url");
-  } else if (codeData.code_challenge_method === "plain") {
-    challengeFromVerifier = code_verifier;
   } else {
     return res.status(400).json({
       error: "invalid_grant",
@@ -405,8 +444,18 @@ async function handleAuthorizationCodeGrant(
     });
   }
 
-  // Code is valid, delete it (authorization codes are single-use)
-  await oauthRepository.deleteAuthCode(code);
+  // Code is valid; consume it atomically. Single-use is enforced by the DELETE
+  // itself (consumeAuthCode is DELETE ... RETURNING), not by the earlier read:
+  // on two concurrent redemptions of the same code only one delete removes the
+  // row, so exactly one caller proceeds and the loser is refused invalid_grant
+  // rather than both minting a token pair for the same code.
+  const consumed = await oauthRepository.consumeAuthCode(code);
+  if (!consumed) {
+    return res.status(400).json({
+      error: "invalid_grant",
+      error_description: "Invalid or expired authorization code",
+    });
+  }
 
   // Issue access token + refresh token
   const { accessToken, refreshToken } = await issueTokenPair(
@@ -463,15 +512,57 @@ async function handleRefreshTokenGrant(
   // Look up the token row by refresh_token
   const tokenData = await oauthRepository.getByRefreshToken(refresh_token);
   if (!tokenData) {
+    // Not a live token — but it may be a refresh token this family already
+    // rotated OUT (migration 0037). Refresh tokens are single-use, so a
+    // rotated-out token presented again is reuse: either the legitimate client
+    // is a step behind (its rotation reply was lost) or the token was stolen
+    // and the thief rotated it. Both are handled the safe way — revoke the
+    // whole family — because the two are indistinguishable at the wire and
+    // leaving the live chain running is the failure that matters. The reuse row
+    // is emitted BEFORE the revoke, and never awaited, for the reason
+    // emitTokenLifecycle documents: the record has to survive a delete that
+    // throws, and the delete is exactly what destroys the family being
+    // investigated. Collapsing the family (live rows AND markers) makes a
+    // replay after revocation take this same branch with no marker to match, so
+    // it falls through to the unknown-token response below — one reuse row per
+    // family compromise, not one per replay.
+    const reused = await oauthRepository.getRotatedRefreshToken(refresh_token);
+    if (reused) {
+      emitTokenLifecycle(req, {
+        action: "oauth.token.reuse",
+        clientId: reused.client_id,
+        userId: reused.user_id,
+        token: refresh_token,
+        outcome: "denied",
+        httpStatus: 400,
+        detail: {
+          reason: "refresh_token_reuse",
+          family_id: reused.family_id,
+        },
+      });
+      const revoked = await oauthRepository.revokeFamily(reused.family_id);
+      logger.warn(
+        `[oauth] refresh token reuse detected; family revoked ` +
+          `client=${reused.client_id} user=${reused.user_id} tokens_revoked=${revoked}`,
+      );
+    }
+    // Byte-identical to the reuse response above and to the disabled-account
+    // and expired branches: a holder of a stolen or stale refresh token learns
+    // only "this no longer works", never that they tripped detection.
     return res.status(400).json({
       error: "invalid_grant",
       error_description: "Invalid refresh token",
     });
   }
 
-  // Check refresh token expiry
+  // Check refresh token expiry. A NULL expiry is treated as expired, NOT as
+  // "valid forever": a row with a refresh token and no expiry is the
+  // never-reaped shape (see migration 0035), and honoring it would
+  // make it an immortal credential. Migration 0035's CHECK makes that shape
+  // unrepresentable going forward; this guard is the defense-in-depth twin that
+  // refuses a legacy row if one ever presents it.
   if (
-    tokenData.refresh_token_expires_at &&
+    !tokenData.refresh_token_expires_at ||
     Date.now() > tokenData.refresh_token_expires_at.getTime()
   ) {
     // Emitted BEFORE the delete, and never awaited — `emit` is fire-and-forget
@@ -480,14 +571,13 @@ async function handleRefreshTokenGrant(
     // row is that the credential it describes no longer exists to be looked
     // up, so writing it after the destruction would lose it in exactly the
     // case an operator is investigating.
-    const destroyed = credentialFingerprint(tokenData.access_token);
     emitTokenLifecycle(req, {
       action: "oauth.token.refresh",
       clientId: tokenData.client_id,
       userId: tokenData.user_id,
       // The refresh token as PRESENTED — `token_sha256` in the row. It is a
       // different string from the access token in the same row, which is
-      // fingerprinted separately below.
+      // recorded separately below.
       token: refresh_token,
       outcome: "failure",
       httpStatus: 400,
@@ -497,15 +587,19 @@ async function handleRefreshTokenGrant(
         // The destroyed row's ACCESS token, under the same keys
         // `emitTokenIssued` writes — this is the join back to the
         // `oauth.token.issue` / `oauth.token.refresh` row that minted the
-        // chain, which is the only place its age is now recorded.
-        access_token_sha256: destroyed.sha256,
-        access_token_last4: destroyed.last4,
+        // chain, which is the only place its age is now recorded. Since
+        // migration 0036 the stored `access_token` IS the sha256 the audit log
+        // records, and `access_token_last4` its tail, so they are used directly
+        // passing the stored hash through credentialFingerprint would hash it
+        // a second time and break the join.
+        access_token_sha256: tokenData.access_token,
+        access_token_last4: tokenData.access_token_last4,
         created_at: isoOrNull(tokenData.created_at),
         expires_at: isoOrNull(tokenData.expires_at),
         refresh_token_expires_at: isoOrNull(tokenData.refresh_token_expires_at),
       },
     });
-    await oauthRepository.deleteAccessToken(tokenData.access_token);
+    await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
     return res.status(400).json({
       error: "invalid_grant",
       error_description: "Refresh token has expired",
@@ -548,14 +642,36 @@ async function handleRefreshTokenGrant(
     });
   }
 
-  // Delete old token row (rotation: old refresh token is single-use)
-  await oauthRepository.deleteAccessToken(tokenData.access_token);
+  // Record the rotated-out refresh token BEFORE deleting the row, so a later
+  // presentation of it is detected as reuse (migration 0037). The marker is
+  // keyed on the stored hash — tokenData.refresh_token is already that digest,
+  // so it is passed through unchanged rather than re-hashed. The row was found
+  // BY its refresh token and passed the expiry guard above, so both the hash
+  // and its expiry are present on the real path; the guard only satisfies the
+  // nullable column types. Recorded before the delete so there is no window in
+  // which the token is neither live nor marked as rotated.
+  if (tokenData.refresh_token && tokenData.refresh_token_expires_at) {
+    await oauthRepository.recordRotatedRefreshToken({
+      refreshTokenHash: tokenData.refresh_token,
+      familyId: tokenData.family_id,
+      clientId: tokenData.client_id,
+      userId: tokenData.user_id,
+      expiresAt: tokenData.refresh_token_expires_at,
+    });
+  }
 
-  // Issue new access token + refresh token
+  // Delete old token row (rotation: old refresh token is single-use). The row
+  // is in hand from getByRefreshToken, so delete by its stored hash rather than
+  // re-hashing it through deleteAccessToken.
+  await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
+
+  // Issue new access token + refresh token. The new pair inherits the rotated
+  // row's family, so reuse of any rotated-out member revokes the whole chain.
   const { accessToken, refreshToken } = await issueTokenPair(
     tokenData.client_id,
     tokenData.user_id,
     tokenData.scope,
+    tokenData.family_id,
   );
 
   // `rotated=true` is unconditional here because this handler always mints a
@@ -639,6 +755,17 @@ function isoOrNull(value: Date | null | undefined): string | null {
  *    token, and it is rate-limited on top, so it is not replay amplification.
  *    A caller naming a different client than the token was issued to is not a
  *    confused client.
+ *  - REFRESH-TOKEN REUSE that revokes a family (migration 0037): emitted, and
+ *    it is the highest-signal event on the grant half of /oauth/token. It is
+ *    reachable only by presenting a refresh token that was already rotated OUT
+ *    of a live family, and detection COLLAPSES the family — the live rows and
+ *    the rotated-token markers alike — so a replay of the same token afterwards
+ *    finds no marker and falls through to the silent unknown-token path. That
+ *    is the bound: one reuse row per family compromise, not one per replay,
+ *    which is tighter than the destroy-attempt bound below. `outcome` is
+ *    `denied` rather than `failure`, so a query for active attacks filters on
+ *    it. Emit-first here too — the revoke is the delete that must not be able to
+ *    lose the record.
  *  - A REJECTION THAT DESTROYS THE ROW IT JUST READ: emitted. Three branches
  *    qualify — an EXPIRED AUTHORIZATION CODE and an EXPIRED REFRESH TOKEN on
  *    /oauth/token, and an EXPIRED ACCESS TOKEN on /oauth/introspect. Each is
@@ -666,10 +793,13 @@ function isoOrNull(value: Date | null | undefined): string | null {
  * atomic and neither delete reports whether it removed anything —
  * `deleteAccessToken` and `deleteAuthCode` both return void — so N concurrent
  * presentations of the SAME expired credential each read the row before the
- * first delete commits, and each writes a row. /oauth/token is per-IP limited
- * by `rateLimitToken` and /oauth/introspect sits behind the failure limiter
- * plus the RFC 7662 credential gate; GET /oauth/userinfo carries no limiter at
- * all, so it is the one a burst actually reaches. Emit-first is the half of
+ * first delete commits, and each writes a row. /oauth/token is per-edge-IP
+ * limited by `rateLimitToken`, /oauth/introspect sits behind the failure
+ * limiter plus the RFC 7662 credential gate, and GET /oauth/userinfo now
+ * carries the same failure-only limiter (see userinfo.ts) — but that limiter
+ * counts failures rather than successes, so a burst of the SAME expired token
+ * can still spend a window's worth of destroy-emits before the bucket fills.
+ * Emit-first is the half of
  * that trade being kept ON PURPOSE: the record has to survive a delete that
  * throws, which is the case an operator is investigating, and buying
  * exactly-once instead would mean gating the emit on a delete that returns a
@@ -698,11 +828,15 @@ function emitTokenLifecycle(
       | "oauth.token.issue"
       | "oauth.token.refresh"
       | "oauth.token.introspect"
-      | "oauth.token.revoke";
+      | "oauth.token.revoke"
+      | "oauth.token.reuse";
     clientId: string;
     userId: string;
     token: string;
-    outcome: "success" | "failure";
+    // `denied` is the reuse verb's outcome (migration 0037): a refused request
+    // that also acted against the caller (it revoked the family), which a query
+    // for active attacks can filter on distinctly from a plain `failure`.
+    outcome: "success" | "failure" | "denied";
     /**
      * Defaults to 200 because every other caller here answers 200 — including
      * the refusals, which is the point of RFC 7662's `{active:false}` and RFC
@@ -1123,7 +1257,9 @@ tokenRouter.post("/oauth/revoke", async (req, res) => {
         if (clientMismatch(tokenData.client_id)) {
           return refuseClientMismatch(tokenData, "refresh_token");
         }
-        await oauthRepository.deleteAccessToken(tokenData.access_token);
+        // The row is in hand from getByRefreshToken, so delete by its stored
+        // hash rather than re-hashing it through deleteAccessToken.
+        await oauthRepository.deleteAccessTokenByHash(tokenData.access_token);
         emitTokenLifecycle(req, {
           action: "oauth.token.revoke",
           clientId: tokenData.client_id,

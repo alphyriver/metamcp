@@ -3,7 +3,6 @@ import {
   OAuthClientInformation,
   OAuthClientInformationSchema,
   OAuthClientMetadata,
-  OAuthMetadata,
   OAuthTokens,
   OAuthTokensSchema,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
@@ -20,8 +19,17 @@ class DbOAuthClientProvider implements OAuthClientProvider {
   constructor(mcpServerUuid: string, serverUrl: string) {
     this.mcpServerUuid = mcpServerUuid;
     this.serverUrl = serverUrl;
-    // Save the server URL to session storage for consistency
-    sessionStorage.setItem(SESSION_KEYS.SERVER_URL, serverUrl);
+    // useConnection() instantiates this provider at render time, and that
+    // render includes the server render of every page that hosts an MCP
+    // connection. sessionStorage is browser-only, so writing it unconditionally
+    // throws "sessionStorage is not defined" during SSR and turns the whole
+    // route into a 500 before the client can hydrate. The write only keeps the
+    // server URL in sync for the client-side OAuth flow (SERVER_URL is read back
+    // exclusively in the browser), so it is skipped when web storage is absent;
+    // the client re-runs the constructor on hydration and performs it then.
+    if (typeof window !== "undefined") {
+      sessionStorage.setItem(SESSION_KEYS.SERVER_URL, serverUrl);
+    }
   }
 
   get redirectUrl() {
@@ -227,52 +235,10 @@ class DbOAuthClientProvider implements OAuthClientProvider {
   }
 }
 
-// Debug version that overrides redirect URL and allows saving server OAuth metadata
-export class DebugDbOAuthClientProvider extends DbOAuthClientProvider {
-  get redirectUrl(): string {
-    return getAppUrl() + "/fe-oauth/callback/debug";
-  }
-
-  saveServerMetadata(metadata: OAuthMetadata) {
-    const key = getServerSpecificKey(
-      SESSION_KEYS.SERVER_METADATA,
-      this.serverUrl,
-    );
-    sessionStorage.setItem(key, JSON.stringify(metadata));
-  }
-
-  getServerMetadata(): OAuthMetadata | null {
-    const key = getServerSpecificKey(
-      SESSION_KEYS.SERVER_METADATA,
-      this.serverUrl,
-    );
-    const metadata = sessionStorage.getItem(key);
-    if (!metadata) {
-      return null;
-    }
-    return JSON.parse(metadata);
-  }
-
-  clear() {
-    super.clear();
-    sessionStorage.removeItem(
-      getServerSpecificKey(SESSION_KEYS.SERVER_METADATA, this.serverUrl),
-    );
-  }
-}
-
 // Factory function to create an OAuth provider for a specific MCP server
 export function createAuthProvider(
   mcpServerUuid: string,
   serverUrl: string,
 ): DbOAuthClientProvider {
   return new DbOAuthClientProvider(mcpServerUuid, serverUrl);
-}
-
-// Factory function to create a debug OAuth provider for a specific MCP server
-export function createDebugAuthProvider(
-  mcpServerUuid: string,
-  serverUrl: string,
-): DebugDbOAuthClientProvider {
-  return new DebugDbOAuthClientProvider(mcpServerUuid, serverUrl);
 }

@@ -50,9 +50,16 @@ import {
   createToolOverridesListToolsMiddleware,
   mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
-import { isRecoverableBackendError } from "./session-error";
+import {
+  isRecoverableBackendError,
+  isToolCallReplaySafeError,
+} from "./session-error";
 import { acquireSessionWithBoundedWarmup } from "./tool-call-warmup";
-import { parseToolName } from "./tool-name-parser";
+import {
+  parseToolName,
+  registerToolRoute,
+  ToolRouteOwner,
+} from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
 
@@ -113,6 +120,11 @@ export const createServer = async (
 ) => {
   const toolToClient: Record<string, ConnectedClient> = {};
   const toolToServerUuid: Record<string, string> = {};
+  // Which server first claimed each fully-qualified tool name, so a second
+  // server that sanitizes to the same prefix and exposes the same tool name is
+  // detected as a collision rather than silently overwriting the route. See
+  // the collision guard at namespace assembly below.
+  const toolNameOwner = new Map<string, ToolRouteOwner>();
   const promptToClient: Record<string, ConnectedClient> = {};
   const resourceToClient: Record<string, ConnectedClient> = {};
 
@@ -440,17 +452,45 @@ export const createServer = async (
           }
 
           // Use original tools for client response (middleware will be applied later)
-          const toolsWithSource = allServerTools.map((tool) => {
+          //
+          // Cross-server tool-name collision guard: the routing maps are keyed on
+          // `sanitizeName(serverName)__toolName`. sanitizeName strips every
+          // character outside [a-zA-Z0-9_-], so two servers in one namespace
+          // whose names sanitize to the same prefix (or share a name, or fall
+          // back to an unvalidated backend-reported version name) and expose
+          // the same tool name would produce the SAME key. Left unchecked,
+          // last writer wins and a call silently routes to the wrong backend.
+          // We keep the FIRST registration, drop the duplicate, and WARN naming
+          // both servers so the operator can rename one. Disambiguating by a
+          // uuid suffix instead was rejected: the assembly runs concurrently
+          // (Promise.allSettled below), so which server won the base name would
+          // be non-deterministic, and it would rename a tool the caller invokes
+          // by name. This synchronous loop is atomic per server relative to the
+          // others, so the check-then-set sees every already-registered server.
+          const toolsWithSource: Tool[] = [];
+          for (const tool of allServerTools) {
             const toolName = `${sanitizeName(serverName)}__${tool.name}`;
+            const outcome = registerToolRoute(
+              toolName,
+              { uuid: mcpServerUuid, name: serverName },
+              toolNameOwner,
+            );
+            if (!outcome.registered) {
+              const other = outcome.collidedWith;
+              logger.warn(
+                `Tool name collision in namespace ${namespaceUuid}: "${toolName}" is exposed by both server "${other?.name}" (${other?.uuid}) and server "${serverName}" (${mcpServerUuid}); keeping the first and dropping the duplicate. Rename one server so their sanitized name prefixes differ.`,
+              );
+              continue;
+            }
             toolToClient[toolName] = activeSession;
             toolToServerUuid[toolName] = mcpServerUuid;
 
-            return {
+            toolsWithSource.push({
               ...tool,
               name: toolName,
               description: tool.description,
-            };
-          });
+            });
+          }
 
           allTools.push(...toolsWithSource);
         } catch (error) {
@@ -732,7 +772,16 @@ export const createServer = async (
     try {
       return (await callOnce(clientForTool)) as CallToolResult;
     } catch (error) {
-      if (!isRecoverableBackendError(error)) {
+      // Replay a tools/call ONLY when the failure proves the backend never
+      // ran it: an HTTP 404 "Session not found" answer to the POST, or a
+      // transport already closed before the send. A tool call is not
+      // idempotent (a delete, a reboot, a password reset), so a timeout, a
+      // connection dropped mid-call or a 5xx surfaces to the client instead:
+      // the backend may have executed it, and a second send runs it twice.
+      // The 2026-09-30 client-side duplicate prompted finding this separate
+      // gateway retry: a 60 s timeout's -32001 read as session-lost. Do not
+      // swap this back to isRecoverableBackendError; see isToolCallReplaySafeError.
+      if (!isToolCallReplaySafeError(error)) {
         logger.error(
           `Error calling tool "${name}" through ${
             clientForTool.client.getServerVersion()?.name || "unknown"
@@ -743,7 +792,7 @@ export const createServer = async (
       }
 
       logger.warn(
-        `Backend connection lost for server ${serverUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+        `Backend connection lost for server ${serverUuid} on tool "${name}" before the call was executed; invalidating pool and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );
