@@ -123,6 +123,7 @@ export interface SessionLifetimeManager<T> {
   removeSession(sessionId: string): void;
   getSession(sessionId: string): T | undefined;
   getSessionBinding(sessionId: string): SessionBinding | undefined;
+  countSessionsForIdentity(identity: SessionIdentity): number;
   getAllSessions(): Map<string, T>;
   getSessionAge(sessionId: string): number | undefined;
   isSessionExpired(sessionId: string): Promise<boolean>;
@@ -175,6 +176,20 @@ export class SessionLifetimeManagerImpl<T>
     return this.sessionBindings.get(sessionId);
   }
 
+  // How many live sessions this manager holds for a given credential identity.
+  // Derived from the binding map on demand rather than from a maintained
+  // counter: a binding is deleted on removeSession, so the count is
+  // self-healing and a missed decrement in one of the cleanup paths cannot leak
+  // it upward and lock a credential out. Feeds the per-credential
+  // concurrent-session ceiling (see lib/metamcp/credential-session-quota).
+  countSessionsForIdentity(identity: SessionIdentity): number {
+    let count = 0;
+    for (const binding of this.sessionBindings.values()) {
+      if (identityMatches(binding.identity, identity)) count += 1;
+    }
+    return count;
+  }
+
   getAllSessions(): Map<string, T> {
     return new Map(this.sessions);
   }
@@ -221,8 +236,15 @@ export class SessionLifetimeManagerImpl<T>
 
       // Clean up expired sessions
       if (expiredSessions.length > 0) {
+        // Count at info, ids at debug only: a live session-id list in a
+        // request-path log undoes the fork's session-id log hygiene. Dormant
+        // in prod (sessionLifetime is null there), but this timer fires the
+        // moment an operator sets a finite lifetime.
         logger.info(
-          `Cleaning up ${expiredSessions.length} expired ${this.name} sessions: ${expiredSessions.map((s) => s.sessionId).join(", ")}`,
+          `Cleaning up ${expiredSessions.length} expired ${this.name} sessions`,
+        );
+        logger.debug(
+          `Expired ${this.name} session ids: ${expiredSessions.map((s) => s.sessionId).join(", ")}`,
         );
 
         await Promise.allSettled(

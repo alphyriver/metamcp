@@ -30,7 +30,10 @@ import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
 } from "../../../lib/metamcp/metamcp-middleware/tool-overrides.functional";
-import { isRecoverableBackendError } from "../../../lib/metamcp/session-error";
+import {
+  isRecoverableBackendError,
+  isToolCallReplaySafeError,
+} from "../../../lib/metamcp/session-error";
 import { acquireSessionWithBoundedWarmup } from "../../../lib/metamcp/tool-call-warmup";
 import { sanitizeName } from "../../../lib/metamcp/utils";
 
@@ -174,12 +177,16 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
   const toolToServerUuid: Record<string, string> = {};
 
   return async (request, context) => {
+    // `name` is the caller-controlled tool name (a URL-decoded path segment on
+    // the OpenAPI path). Every log line and thrown message below runs it
+    // through JSON.stringify so an embedded CR/LF cannot forge log lines, the
+    // same discipline as the mcp-proxy connection log.
     const { name, arguments: args } = request.params;
 
     // Extract the original tool name by removing the server prefix
     const firstDoubleUnderscoreIndex = name.indexOf("__");
     if (firstDoubleUnderscoreIndex === -1) {
-      throw new Error(`Invalid tool name format: ${name}`);
+      throw new Error(`Invalid tool name format: ${JSON.stringify(name)}`);
     }
 
     const serverPrefix = name.substring(0, firstDoubleUnderscoreIndex);
@@ -269,7 +276,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     }
 
     if (!targetSession) {
-      throw new Error(`Unknown tool: ${name}`);
+      throw new Error(`Unknown tool: ${JSON.stringify(name)}`);
     }
 
     const targetServerUuid = toolToServerUuid[name];
@@ -318,9 +325,19 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       // session via the pool, retry once. Logs are tagged "OpenAPI
       // bridge" so operators can split this recovery from the
       // Streamable-HTTP one when investigating.
-      if (!isRecoverableBackendError(error)) {
+      //
+      // The retry is gated on isToolCallReplaySafeError, NOT the
+      // isRecoverableBackendError the tools/list path above uses: a
+      // tools/call is replayed only when the failure proves the backend
+      // never ran it (HTTP 404 "Session not found", or a transport closed
+      // before the send). A timeout, a mid-call drop or a 5xx surfaces
+      // with no replay, because the backend may already have executed a
+      // non-idempotent tool and a second send runs it twice. Found while
+      // investigating the 2026-09-30 client-side duplicate; same rule as
+      // metamcp-proxy.ts.
+      if (!isToolCallReplaySafeError(error)) {
         logger.error(
-          `Error calling tool "${name}" through ${
+          `Error calling tool ${JSON.stringify(name)} through ${
             targetSession.client.getServerVersion()?.name || "unknown"
           }:`,
           error,
@@ -329,7 +346,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
       }
 
       logger.warn(
-        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+        `OpenAPI bridge: backend connection lost for server ${targetServerUuid} on tool ${JSON.stringify(name)}; invalidating pool and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );
@@ -368,7 +385,7 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
         return (await callOnce(freshSession)) as CallToolResult;
       } catch (retryError) {
         logger.error(
-          `OpenAPI bridge: error calling tool "${name}" through ${
+          `OpenAPI bridge: error calling tool ${JSON.stringify(name)} through ${
             freshSession.client.getServerVersion()?.name || "unknown"
           } after session re-initialize:`,
           retryError,

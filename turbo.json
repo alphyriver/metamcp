@@ -31,6 +31,7 @@
     "LOG_MAX_SIZE_MB",
     "EXTRA_TRUSTED_ORIGINS",
     "ALLOW_UNAUTHENTICATED_ENDPOINTS",
+    "ADMIN_PLANE_TOKEN_AUTH_DISABLED",
     "AUTH_SIGNIN_RATE_LIMIT_MAX",
     "AUTH_SIGNIN_RATE_LIMIT_WINDOW_SECONDS",
     "AUTH_SIGNIN_RATE_LIMIT_DISABLED",
@@ -55,6 +56,7 @@
     "MCP_SESSION_PRUNER_INTERVAL_MS",
     "PUBLIC_SESSION_TTL_SECONDS",
     "SESSION_SWEEP_INTERVAL_SECONDS",
+    "MCP_MAX_SESSIONS_PER_CREDENTIAL",
     "MCP_RECONNECT_BACKOFF_INITIAL_MS",
     "MCP_RECONNECT_BACKOFF_MAX_MS",
     "MCP_RECONNECT_BACKOFF_MULTIPLIER",
@@ -70,6 +72,7 @@
     "TOOLS_SWEEP_INTERVAL_SECONDS",
     "MAX_TOTAL_CONNECTIONS",
     "MAX_CONNECTIONS_PER_SERVER",
+    "MCP_POOL_MIN_CONNECTIONS_PER_NAMESPACE",
     "M365_TENANT_ID",
     "M365_CLIENT_ID",
     "M365_CLIENT_SECRET",
@@ -83,7 +86,10 @@
   // developer's (and each rotation of) the runtime password would miss the
   // whole shared cache. Nothing turbo builds depends on the value; only the
   // running container does.
-  "globalPassThroughEnv": ["METAMCP_RUNTIME_DB_PASSWORD"],
+  "globalPassThroughEnv": [
+    "METAMCP_RUNTIME_DB_PASSWORD",
+    "GATEWAY_BACKEND_SECRET"
+  ],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
