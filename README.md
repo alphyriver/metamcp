@@ -95,8 +95,11 @@ Grouped by the property they defend. Every entry maps to one or more fork PRs do
 
 ### Access control
 
-- **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry.
+- **RBAC admin gate on tRPC mutations** — a `users.role` (`admin` / `member`) surfaced into the session; an `adminProcedure` gates all destructive/config mutations (create/update/delete of servers, namespaces, endpoints; namespace curation; tools catalog writes; global config; API-key administration; public-key minting). Members keep read surfaces and manage their own private keys. Plus API-key `last_used_at` telemetry. Administrators are named by configuration; see [Administrators](#administrators).
+- **Admin list-all**: `namespaces.listAll`, `endpoints.listAll` and `mcpServers.listAll` are admin-only and return every row with its owner (`user_id`, null for public), so administrators can see rows owned by other users. Opening, editing or deleting such a row still requires being its owner. The existing `list` procedures are unchanged (public rows plus the caller's own, for admins too), because consumers that match rows by name, such as a config sync over `mcpServers.list`, must not start seeing rows they never saw before. The namespace create form always creates a public namespace and no longer offers a "For myself" option, which never made a namespace private.
+- **Per-namespace tool policy**: each namespace is either `allow_all` (the default: a tool with no curation row is served, so a tool added to a server later appears there without review) or `allowlist` (only tools switched on in the namespace are listed or callable, so a new tool stays hidden until an administrator switches it on). Set with the admin-only `namespaces.setToolPolicy` (audited as `namespace.tool_policy`; also a switch on the namespace page) and returned as `tool_policy` on every namespace response. A tools refresh in an allowlist namespace records new tools switched off and never changes an existing tool's state. Saving a namespace's server list reconciles rows: rows of servers that left the list are deleted, retained tool and server rows keep their status, overrides and identity, and new tool rows start ACTIVE under `allow_all` and INACTIVE under `allowlist` ([#212](https://github.com/Umbrella-IT-Group/metamcp/pull/212)). Ships inert: every existing namespace is `allow_all`, and setting it back is the rollback.
 - **Endpoint access groups** — named groups that decide which OAuth users may reach which endpoints, so publishing one connector per business system no longer means publishing all of them to everyone who can log in. See [Access groups](#access-groups).
+- **API-key IP allowlists**: per-key or global CIDR lists in audit or enforce mode, checked on the data plane, token introspection and the admin-plane bearer. OAuth is never affected. See [API-key IP allowlists](#api-key-ip-allowlists).
 
 ### Observability
 
@@ -283,7 +286,24 @@ Bootstrap is exempt from its own lock, and it has to be. It creates the configur
 
 One limit worth knowing: these controls are only asserted when bootstrap runs at all. A `BOOTSTRAP_ENABLE=false` deploy writes no row, which upstream's readers treat as open, so such a deploy keeps upstream's behaviour and has to close registration by hand in the admin UI.
 
-Admin identity is a deployment concern, not a committed one. Provision the account through `BOOTSTRAP_USERS` and let the deployment name its own administrator through configuration at boot (the private platform overlay supplies the address via `METAMCP_ADMIN_EMAIL`) rather than a literal baked into a committed migration. Two early seed migrations (`0020_users_role.sql`, `0022_promote_ci_admin.sql`) predate this and promote specific addresses by literal; they are left in place because they have already run in production and this repository's history is public, so rewriting them would change nothing an attacker cannot already read while breaking every deployed migration checksum. The `migrations-no-email-literals` backend test fails any migration written after the current head that reintroduces an address literal, so the seed identities stay a bounded, historical residual.
+### Administrators
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `METAMCP_ADMIN_EMAIL` | unset | Comma-separated email addresses of existing accounts to promote to `admin` on every boot. Matched case-insensitively. |
+
+Accounts get the `member` role by default, and only an administrator can change admin-gated settings or curate servers, namespaces, endpoints and API keys. There is no UI path to grant the role, so the deployment names its administrators here and every boot converges the database toward that list. It runs after migrations and environment bootstrap, so an account `BOOTSTRAP_USERS` creates is promoted on the same boot, and before the server starts listening. It is independent of `BOOTSTRAP_ENABLE`.
+
+- **Named accounts only.** Nothing is ever promoted by position (no "first user" or "only user" rule).
+- **Never demotes.** Removing an address from the list leaves that account an administrator; demote it deliberately in the database.
+- **Never creates accounts.** An address with no account logs a warning and is promoted on the first boot after the account exists.
+- **Ambiguous addresses are skipped.** If one address matches two accounts that differ only in letter case, neither is promoted and a warning says so.
+- **Audited.** Each promotion writes a `user.role.set` row to `audit_log` (`actor_type` `system`, `detail.source` `admin_email_env`). A restart that changes nothing writes nothing.
+- **Unset is a no-op.** With the variable unset or empty, nothing is written; the boot log records how many administrators exist.
+
+If no administrator exists after the pass, the boot log carries a `NO ADMINISTRATOR` warning naming this variable and the SQL fallback: `UPDATE users SET role = 'admin' WHERE email = '<address>';`. **Upgrading an existing install past migration `0020`** turns every existing account into a `member`, so set `METAMCP_ADMIN_EMAIL` to your own address before (or right after) the upgrade and restart.
+
+Admin identity is a deployment concern, not a committed one: name it through `METAMCP_ADMIN_EMAIL`, not a literal baked into a committed migration. Two early seed migrations (`0020_users_role.sql`, `0022_promote_ci_admin.sql`) predate this and promote specific addresses by literal; they are left in place because they have already run in production and this repository's history is public, so rewriting them would change nothing an attacker cannot already read while breaking every deployed migration checksum. The `migrations-no-email-literals` backend test fails any migration written after the current head that reintroduces an address literal, so the seed identities stay a bounded, historical residual.
 
 ### Sign-in rate limiting
 
@@ -324,6 +344,7 @@ Lazy recovery takes part in the ceiling under the rule "evict, never refuse" (ru
 |---|---|---|
 | `OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `86400` (24h) | MCP OAuth access-token lifetime (was hardcoded 1h upstream). |
 | `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `31536000` (365d) | MCP OAuth refresh-token lifetime. Refresh tokens rotate on use. |
+| `OAUTH_REFRESH_CLIENT_AUTH` | `log` | Client authentication on the refresh_token grant for a confidential client (`client_secret_post` or `client_secret_basic`; public `none` clients are never affected). `log` checks the secret the way the authorization_code grant does, records the outcome (`verified`, `missing` or `invalid`, never the value) as `client_auth=` on the `[oauth] token issued` line and in the `oauth.token.refresh` audit row, warns on anything but `verified`, and still issues. `enforce` refuses anything but `verified` with 401 `invalid_client` (RFC 6749 section 6) and leaves the refresh token unrotated. Any other value falls back to `log` with a warning; the value in effect is logged at boot. |
 | `BETTER_AUTH_SESSION_EXPIRES_IN_SECONDS` | `2592000` (30d) | Better-auth session lifetime. |
 | `BETTER_AUTH_SESSION_UPDATE_AGE_SECONDS` | `604800` (7d) | Better-auth session refresh age. |
 | `SESSION_LIFETIME` | unset (persistent) | Backend MCP session lifetime; unset = never expire. |
@@ -492,6 +513,28 @@ Three properties worth stating plainly, because each is a deliberate boundary ra
 Membership decisions are cached in-process for 60 seconds and dropped immediately when any group or endpoint mapping changes, so a revocation takes effect on the caller's next request. Across multiple backend replicas the cache is per-process, and 60 seconds is the worst-case convergence.
 
 One limit worth knowing: the gate runs per request, so restricting an endpoint does not disconnect a notification stream that is already open. No tool call can land through it, because every call is a fresh request that re-runs the gate, but `list_changed` and log notifications keep flowing on that connection until the client disconnects.
+
+### API-key IP allowlists
+
+An API key normally works from any address, so a key that leaks works for whoever holds it. An IP allowlist binds a key to the networks its real caller uses. It applies to API keys only: OAuth sign-ins (MCP connectors, browser and SSO sessions) are never evaluated against it.
+
+Each key either has its own list (`api_keys.allowed_cidrs`) with its own mode, or has none and follows the **global** list and mode. A mode is one of:
+
+| mode | effect on a request from an address outside the list |
+| --- | --- |
+| `off` (default) | nothing is checked |
+| `audit` | the request is served and a throttled `apikey.ip.would_deny` audit row is written |
+| `enforce` | the request is refused with `403` and the same generic message other credential refusals use, and a throttled `apikey.ip.denied` audit row is written |
+
+Both rows carry `detail.reason = "api_key_ip_not_allowed"`, the surface (`data_plane`, `oauth_introspect` or `admin_plane`), the policy source (`key` or `global`) and why the address failed (`not_in_list`, `missing`, `unparsable`). Rows are throttled to one per key and address per ten minutes, plus a per-key budget per window, with the suppressed counts carried on the next row, so a refused caller cannot flood the append-only audit table.
+
+Where it is checked: inside both key validators, so it covers the data plane (`/metamcp/*`, both API-key branches), `POST /oauth/introspect` and the admin-plane bearer on `/trpc`. The admin UI's `apiKeys.validate` helper deliberately does not check it. The client address is `CF-Connecting-IP` (see the trust note in `middleware/audit-context.middleware.ts`); `X-Forwarded-For` and the socket address are never used. Under `enforce`, a request with no readable address is refused.
+
+The one exemption is explicit: a list holding both `0.0.0.0/0` and `::/0` admits any address and also a request with no address, for callers with no stable address such as CI runners.
+
+On the data plane, an IP refusal is evaluated before the plane, account and endpoint-scope checks, so a holder from the wrong address learns nothing about the key; on `/trpc` the check runs after the plane check, so a data-plane key presented there gets the usual 401. An IP refusal is not counted by the failed-credential rate limiter, because the credential itself is valid.
+
+It ships inert: every existing key follows the global policy, whose mode is unset (`off`). Administrators manage policies on the **API Keys** page (an **IP policy** column and editor in the admin table, and a **Global IP policy** panel above it) or through the admin-only tRPC procedures `apiKeys.setIpPolicy`, `apiKeys.getGlobalIpPolicy` and `apiKeys.setGlobalIpPolicy`; each write emits an `apikey.ip_policy.set` or `config.api_key_ip_policy.set` audit row with the old and new value. `apiKeys.listAll` shows each key's list, mode and `last_used_ip` (the address of its last request, updated with `last_used_at`). The server refuses `enforce` with an empty list, a per-key mode without a per-key list, and any entry that is not a valid CIDR (including one with host bits set). `API_KEY_IP_POLICY_DISABLED=true` turns all IP evaluation off process-wide (see `example.env`).
 
 For reverse-proxy (nginx) setups with SSE long connections, see [`nginx.conf.example`](nginx.conf.example). A 2–4GB instance is the practical minimum for a hosted deployment.
 
