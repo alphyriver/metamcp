@@ -82,6 +82,23 @@ LABEL org.opencontainers.image.vendor="alphyriver"
 # Install curl for health checks
 RUN apt-get update && apt-get install -y curl postgresql-client && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# jemalloc instead of glibc malloc for every process in the image.
+#
+# The backend's resident memory grew 80-130 MB/day until it hit the container's
+# 1 GiB limit, while its JS heap stayed flat (heap snapshots an hour apart on
+# 2026-11-10: 77.5 -> 78.1 MB). The growth was glibc's MAIN arena ([heap] 332 MB
+# of 480 MB rss; JS heap 87 MB, external 4 MB): native memory from Node's
+# HTTP/TLS/connection churn that glibc keeps fragmented instead of returning to
+# the OS. jemalloc is the standard remedy for this Node-on-glibc pattern.
+#
+# The library path differs per architecture (this image is built for amd64 and
+# arm64), so link whatever dpkg installed to one fixed path and preload that.
+RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2 \
+    && ln -s "$(dpkg -L libjemalloc2 | grep 'libjemalloc\.so\.2$')" /usr/local/lib/libjemalloc.so.2 \
+    && test -e /usr/local/lib/libjemalloc.so.2 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+ENV LD_PRELOAD=/usr/local/lib/libjemalloc.so.2
+
 # Create non-root user with proper home directory
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 --home /home/nextjs nextjs && \
