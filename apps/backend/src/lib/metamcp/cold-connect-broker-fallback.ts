@@ -1,11 +1,14 @@
 /**
  * COLD-connect broker-failure fallback for the `tools/call` handler
- * (Track A5). The mint can fail on the backend `initialize` handshake
- * during a fresh connect — that throw is swallowed by the pool's connect
- * path (resolves `undefined`) and by the proxy's dynamic-find
- * catch-and-continue, so it reaches the outer `tools/call` catch as a
- * generic error rather than the typed `M365BrokerError` the WARM path
- * gets. `client.ts`'s connect catch latches the broker failure into the
+ * (Track A5). BACKSTOP for `m365`: its `initialize` handshake mints no
+ * token any more (`m365/injected-fetch.ts`, invariant 5), so a connect to
+ * it cannot fail on a broker error and nothing is latched for it. This is
+ * kept for any other injected server and for a future handshake that mints:
+ * a mint that fails on the backend `initialize` handshake during a fresh
+ * connect throws into the pool's connect path (resolves `undefined`) and
+ * the proxy's dynamic-find catch-and-continue, so it reaches the outer
+ * `tools/call` catch as a generic error rather than the typed
+ * `M365BrokerError` the WARM path gets. `client.ts`'s connect catch latches the broker failure into the
  * request-scoped sink (`m365/request-context.ts`) for exactly this
  * reason; this module is the drain + ownership-gate glue that turns the
  * latch back into the same enrollment result the WARM path returns
@@ -32,10 +35,12 @@ import { sanitizeName } from "./utils";
  * the latched failure belongs to a DIFFERENT server than the tool being
  * called — in both cases the caller should re-throw its original error.
  *
- * Gated on ownership: routing an unrelated tool can inadvertently
- * probe-connect the m365 backend (dynamic-find walks every server in the
- * namespace) and latch a failure that must not hijack the real tool's
- * error. Only the injected m365 server can ever latch here today.
+ * Gated on ownership: a latched failure from any server other than the
+ * one the tool's prefix names must not hijack the real tool's error.
+ * Routing now connects only the prefix's own servers (tool-call-routing.ts;
+ * it used to walk every server in the namespace), so a foreign latch is
+ * unlikely, and the gate keeps it harmless if one ever occurs. Only the
+ * injected m365 server can ever latch here today.
  *
  * ALWAYS drains via `takeConnectBrokerFailure` — even on a non-match —
  * so a stale failure from probing an unrelated server during dynamic

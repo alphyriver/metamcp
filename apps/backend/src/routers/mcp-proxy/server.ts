@@ -35,6 +35,11 @@ import {
   getDefaultEnvironment,
   resolveEnvVariables,
 } from "../../lib/metamcp/utils";
+import {
+  getVerifiedCallerServerNames,
+  isVerifiedCallerHeaderName,
+  withoutVerifiedCallerHeader,
+} from "../../lib/metamcp/verified-caller";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
 
 // `x-mcp-actor` is best-effort, client-asserted attribution: it names who an
@@ -305,6 +310,31 @@ const NO_REMOTE_SERVER_CONTEXT =
   "Unable to establish who is making this request. Sign in again and retry.";
 
 /**
+ * Refusal for an `x-custom-auth-header` that names the gateway-set identity
+ * header. See getHttpHeaders.
+ */
+const INSPECTOR_RESERVED_HEADER =
+  "X-Umbrella-User-Id is set by the gateway from the signed-in caller and cannot be supplied as a custom header.";
+
+/**
+ * A matched row's stored headers, for merging into an Inspector connection.
+ *
+ * For a backend named in VERIFIED_CALLER_SERVER_NAMES a stored
+ * X-Umbrella-User-Id is dropped: on the pooled path `withVerifiedCaller`
+ * strips it from every request, and the Inspector's direct transports do not
+ * go through that wrapper, so without this the row would supply a fixed
+ * identity here. Every other row's headers are returned exactly as stored.
+ */
+const storedHeadersFor = (
+  server: DatabaseMcpServer | undefined,
+): Record<string, string> => {
+  const stored = server?.headers || {};
+  return server && getVerifiedCallerServerNames().has(server.name)
+    ? withoutVerifiedCallerHeader(stored)
+    : stored;
+};
+
+/**
  * Find the registered `mcp_servers` row that describes a REMOTE (SSE or
  * STREAMABLE_HTTP) destination, SCOPED TO WHAT THE CALLER MAY SEE, or
  * undefined when nothing they can see matches.
@@ -385,6 +415,14 @@ const getHttpHeaders = (
   // If the header "x-custom-auth-header" is present, use its value as the custom header name.
   if (req.headers["x-custom-auth-header"] !== undefined) {
     const customHeaderName = req.headers["x-custom-auth-header"] as string;
+    // X-Umbrella-User-Id is set by the gateway from the verified caller for
+    // the backends that act on it (VERIFIED_CALLER_SERVER_NAMES, and the m365
+    // injection). Copying a caller-chosen value onto it would hand such a
+    // backend someone else's identity, so the Inspector refuses the name
+    // outright, for every destination, rather than drop it silently.
+    if (isVerifiedCallerHeaderName(customHeaderName)) {
+      throw new Error(INSPECTOR_RESERVED_HEADER);
+    }
     const lowerCaseHeaderName = customHeaderName.toLowerCase();
     if (req.headers[lowerCaseHeaderName] !== undefined) {
       const value = req.headers[lowerCaseHeaderName];
@@ -459,7 +497,7 @@ const cleanupSession = async (sessionId: string) => {
  */
 const closeUninitializedSession = async (
   sessionId: string,
-  webAppTransport: Transport,
+  webAppTransport: Transport | undefined,
   serverTransport: Transport,
 ) => {
   logger.info(
@@ -474,7 +512,7 @@ const closeUninitializedSession = async (
     );
   }
   try {
-    await webAppTransport.close();
+    await webAppTransport?.close();
   } catch (error) {
     logger.error(
       `Error closing web app transport for uninitialized session ${sessionId}:`,
@@ -587,7 +625,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
 
     // Merge custom headers from database with passthrough headers from request
     const headers = {
-      ...(matchingServer?.headers || {}),
+      ...storedHeadersFor(matchingServer),
       ...getHttpHeaders(req, transportType),
     };
 
@@ -662,7 +700,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
 
     // Merge custom headers from database with passthrough headers from request
     const headers = {
-      ...(matchingServer?.headers || {}),
+      ...storedHeadersFor(matchingServer),
       ...getHttpHeaders(req, transportType),
     };
 
@@ -705,6 +743,9 @@ serverRouter.get("/mcp", async (req, res) => {
 serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let serverTransport: Transport | undefined;
+  // Hoisted so the error path below can tell what this request started.
+  let newSessionId: string | undefined;
+  let webAppTransport: StreamableHTTPServerTransport | undefined;
   if (!sessionId) {
     try {
       logger.info("New StreamableHttp connection request");
@@ -754,60 +795,72 @@ serverRouter.post("/mcp", refuseDeclaredOversize, async (req, res) => {
       }
 
       // Generate session ID upfront for better tracking
-      const newSessionId = randomUUID();
+      const sessionIdForRequest = randomUUID();
+      newSessionId = sessionIdForRequest;
 
-      const webAppTransport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => newSessionId,
+      const transportToClient = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionIdForRequest,
         // See lib/metamcp/mcp-request-body-limit for the value and why.
         maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
         onsessioninitialized: (sessionId) => {
-          webAppTransports.set(sessionId, webAppTransport);
+          webAppTransports.set(sessionId, transportToClient);
           if (serverTransport) {
             serverTransports.set(sessionId, serverTransport);
           }
           logger.info("Client <-> Proxy  sessionId: " + sessionId);
         },
       });
+      webAppTransport = transportToClient;
       logger.info("Created StreamableHttp client transport");
 
-      await webAppTransport.start();
+      await transportToClient.start();
 
-      // Set up proxy connection with error handling
-      try {
-        mcpProxy({
-          transportToClient: webAppTransport,
-          transportToServer: serverTransport,
-          onCleanup: async () => {
-            await cleanupSession(newSessionId);
-          },
-        });
-      } catch (error) {
-        logger.error(
-          `Error setting up proxy for session ${newSessionId}:`,
-          error,
-        );
-        await cleanupSession(newSessionId);
-        throw error;
-      }
+      // Set up proxy connection. A throw here reaches the catch below, which
+      // closes both transports (the session is not initialized yet).
+      mcpProxy({
+        transportToClient,
+        transportToServer: serverTransport,
+        onCleanup: async () => {
+          await cleanupSession(sessionIdForRequest);
+        },
+      });
 
       // Handle the actual request - don't pass req.body since it wasn't parsed
-      await (webAppTransport as StreamableHTTPServerTransport).handleRequest(
-        req,
-        res,
-      );
+      await transportToClient.handleRequest(req, res);
 
       // Answered without initializing: no session id went out, so close what
       // this request started. An initialized session is left as it is.
-      if (webAppTransport.sessionId === undefined) {
+      if (transportToClient.sessionId === undefined) {
+        await closeUninitializedSession(
+          sessionIdForRequest,
+          transportToClient,
+          serverTransport,
+        );
+      }
+    } catch (error) {
+      logger.error("Error in /mcp POST route:", error);
+      // Close what this request started unless it became a live session. The
+      // proxy wiring or the first request can throw before
+      // `onsessioninitialized` fills the session maps, and `cleanupSession`
+      // finds nothing in empty maps, so the upstream transport (a STDIO child,
+      // an SSE stream) used to stay open with no session id that could ever
+      // reach it. A session that did initialize is left as the success path
+      // leaves it: its id went to the client, which can use it or DELETE it.
+      if (
+        serverTransport &&
+        newSessionId &&
+        webAppTransports.get(newSessionId) !== webAppTransport
+      ) {
         await closeUninitializedSession(
           newSessionId,
           webAppTransport,
           serverTransport,
         );
       }
-    } catch (error) {
-      logger.error("Error in /mcp POST route:", error);
-      res.status(500).json(error);
+      // A throw after the response started cannot be answered with a status.
+      if (!res.headersSent) {
+        res.status(500).json(error);
+      }
     }
   } else {
     // logger.info(`Received POST message for sessionId ${sessionId}`);

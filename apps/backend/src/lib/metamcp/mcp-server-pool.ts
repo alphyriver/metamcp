@@ -1,4 +1,5 @@
 import {
+  ErrorCode,
   ListToolsResultSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -15,6 +16,7 @@ import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { configService } from "../config.service";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
 import { serverErrorTracker } from "./server-error-tracker";
+import { toolsListRenotifyWatch } from "./tools-list-renotify";
 import { toolsSyncCache } from "./tools-sync-cache";
 
 // Per-server tools/list timeout for the periodic sweep. Bounds a single
@@ -30,6 +32,38 @@ const TOOLS_SWEEP_REQUEST_TIMEOUT_MS = 10000;
 // sweepToolDefinitions's `finally`, so every future tick would be skipped
 // by the in-flight guard forever.
 const TOOLS_SWEEP_MAX_PAGES = 50;
+
+// Bound on the re-notify probe's tools/list (probeServerTools). A backend
+// that takes longer than this to list is not ready to be re-listed by every
+// owed session at once; the watch probes again on its backoff.
+const TOOLS_LIST_PROBE_TIMEOUT_MS = 10000;
+
+/**
+ * Whether a rejected health-check ping was in fact ANSWERED by the backend
+ * with JSON-RPC -32601 "Method not found" (upstream metatool-ai/metamcp #337).
+ *
+ * `ping` is optional in the MCP spec ("The Model Context Protocol includes an
+ * optional ping mechanism", basic/utilities/ping), so a healthy backend may
+ * not implement it. Its error reply is still a reply over a working
+ * connection, so it proves the connection alive; the spec's failure signal is
+ * silence ("Timeouts SHOULD be treated as connection failures"). Without this,
+ * both health checks treat such a backend as dead on every sweep: the idle
+ * check recreates its idle connection every 60 s forever, and the active
+ * check cascade-invalidates every pooled connection every second sweep.
+ *
+ * Deliberately narrow: only the numeric code the SDK sets on the McpError it
+ * builds from an error RESPONSE. A timeout (-32001), a closed connection
+ * (-32000) or a transport throw carries a different code or none and still
+ * counts as dead. No message match, so a message that merely mentions "ping"
+ * or "not found" cannot pass for an answer.
+ */
+export function isPingAnsweredError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === ErrorCode.MethodNotFound
+  );
+}
 
 // How long shutdown waits for connects already in flight. A connect has no
 // cancellation hook and can stay pending indefinitely: an SSE backend that
@@ -152,11 +186,13 @@ export class McpServerPool {
   //     invalidation fan-out reaches no one and nothing downstream ever
   //     touches toolsSyncCache. Comparing against that frozen cache would
   //     re-detect the SAME already-handled change every tick, forever.
-  //   - tools.impl.sync overwrites toolsSyncCache with the
-  //     NAMESPACE-FILTERED tool set whenever filterOutOverrideTools drops a
-  //     tool, while the sweep always lists the UNFILTERED set — a
+  //   - Until 2026-10-14 tools.impl.sync overwrote toolsSyncCache with the
+  //     NAMESPACE-FILTERED tool set whenever filterOutOverrideTools dropped
+  //     a tool, while the sweep always lists the UNFILTERED set — a
   //     permanent false-drift mismatch even for servers with active
-  //     consumers.
+  //     consumers. The tools/list path now claims the unfiltered set, but
+  //     the cache still belongs to that path and to the UI's sync, so the
+  //     sweep keeps its own baseline.
   // Owning a separate baseline makes both impossible: always
   // unfiltered-vs-unfiltered, and updating it the moment a change is
   // observed makes the invalidate fire exactly ONCE per real change.
@@ -322,8 +358,19 @@ export class McpServerPool {
    * bypasses getInstance() entirely and would have missed this bug too).
    * Callers must cleanupAll() the outgoing instance themselves first — this
    * only clears the reference, it doesn't tear down timers/sessions.
+   *
+   * Refuses outside a test run (vitest sets NODE_ENV to "test" when it is
+   * unset). Called in a running gateway it would orphan the live pool, its
+   * timers and every connection it holds behind a fresh, empty one, so a
+   * stray call fails loudly instead. Production leaves NODE_ENV unset or sets
+   * "production", and both refuse.
    */
   static resetInstanceForTests(): void {
+    if (process.env.NODE_ENV !== "test") {
+      throw new Error(
+        `McpServerPool.resetInstanceForTests() is test-only (NODE_ENV=${process.env.NODE_ENV ?? "unset"})`,
+      );
+    }
     McpServerPool.instance = null;
   }
 
@@ -778,6 +825,10 @@ export class McpServerPool {
     this.serverLastSuccessAt[serverUuid] = Date.now();
     delete this.lastConnectFailureAt[serverUuid];
     serverErrorTracker.markSuccess(serverUuid);
+    // A session whose tools/list left this server out is owed a
+    // list_changed once it answers again: probe it now rather than on the
+    // watch's backoff. A no-op when nobody is owed.
+    toolsListRenotifyWatch.notifyConnected(serverUuid);
   }
 
   /**
@@ -1599,6 +1650,96 @@ export class McpServerPool {
   }
 
   /**
+   * True while `client` still holds a pool slot for `serverUuid`: an active
+   * slot in any session, or the server's idle slot.
+   *
+   * A tools/call recovery asks this before invalidating. An invalidation
+   * retires EVERY client of the server, so a caller whose client was already
+   * retired by someone else's invalidation (another session, or a parallel
+   * call in the same one) must not invalidate again: that second cascade would
+   * retire the fresh connection the first one just built, and cut calls
+   * already running on it. Such a caller only needs a new session.
+   */
+  isPooledClient(serverUuid: string, client: ConnectedClient): boolean {
+    if (this.idleSessions[serverUuid] === client) return true;
+    for (const servers of Object.values(this.activeSessions)) {
+      if (servers[serverUuid] === client) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Whether `params`' backend lists its tools right now: the probe of the
+   * tools/list re-notify watch (tools-list-renotify.ts).
+   *
+   * Uses an existing pooled connection, preferring the idle slot, or creates
+   * an idle connection if none exists (the same connect the health timer's
+   * idle refill makes every 60 s, under the same caps). Lists the first page
+   * with a bounded timeout, without moving any session's active slot. An
+   * active connection must be usable here too: at the per-server cap there
+   * may never be room for an idle slot, even after the backend recovers.
+   * This read-only request shares a client just as the tool drift sweep does.
+   * A listing over a connection that predates a restart fails, so a stale
+   * idle client cannot read as recovered; the idle health check retires it
+   * on its next tick.
+   *
+   * False, never a throw, when the pool is shutting down, another creation
+   * for the server is in flight (the watch probes again when that connect
+   * lands), the connect fails, or the listing fails or times out.
+   */
+  async probeServerTools(
+    params: ServerParameters,
+    namespaceUuid?: string,
+  ): Promise<boolean> {
+    if (this.cleanupAllPromise) return false;
+    const serverUuid = params.uuid;
+    let client =
+      this.idleSessions[serverUuid] ??
+      this.findOldestActiveConnectionForServer(serverUuid);
+    if (!client) {
+      try {
+        await this.createIdleSession(serverUuid, params, namespaceUuid);
+      } catch (error) {
+        logger.info(
+          `tools/list re-notify probe: connect to server ${params.name} (${serverUuid}) failed:`,
+          error,
+        );
+        return false;
+      }
+      client =
+        this.idleSessions[serverUuid] ??
+        this.findOldestActiveConnectionForServer(serverUuid);
+    }
+    if (!client) return false;
+    const probeClient = client;
+    const generation = this.idleSessionGenerations[serverUuid] ?? 0;
+    // Invalidation can detach this client while its reply is in flight.
+    // Such a reply proves nothing about the replacement backend. Adoption
+    // into an active slot is fine, provided it still belongs to this pool.
+    const stillCurrent = () =>
+      !this.cleanupAllPromise &&
+      (this.idleSessionGenerations[serverUuid] ?? 0) === generation &&
+      this.isPooledClient(serverUuid, probeClient);
+    try {
+      await probeClient.client.request(
+        { method: "tools/list", params: {} },
+        ListToolsResultSchema,
+        { timeout: TOOLS_LIST_PROBE_TIMEOUT_MS },
+      );
+      return stillCurrent();
+    } catch (error) {
+      // -32601 is an answer over a working connection from a backend that
+      // serves no tools: it is up, and there is nothing more to wait for.
+      if (isPingAnsweredError(error)) return stillCurrent();
+      logger.info(
+        `tools/list re-notify probe: server ${params.name} (${serverUuid}) did not answer tools/list yet:`,
+        error,
+      );
+      return false;
+    }
+  }
+
+  /**
    * Drop the pooled backend connection(s) for a given (sessionId, serverUuid).
    *
    * Used when the backend MCP server reports our Mcp-Session-Id is unknown
@@ -1642,8 +1783,14 @@ export class McpServerPool {
     // (Claude Code, Claude.ai) learns the tool list is suspect and
     // re-fetches on next interaction. Without this, a fresh
     // ConnectedClient appears in the pool but no upstream notification
-    // is ever emitted (backend FastMCP doesn't emit on its own startup;
-    // that's a separate, future PR).
+    // is ever emitted (a backend has no session to notify on its own
+    // startup, so it cannot do this itself).
+    //
+    // This fan-out fires while the backend is usually still DOWN, so a
+    // consumer that re-lists at once can get a listing without this
+    // server. That session is then owed a second list_changed once the
+    // server answers again: the proxy arms tools-list-renotify.ts for it,
+    // and markServerSuccess triggers its probe on the next connect.
     const doomedClients = this.detachServerClients(serverUuid);
 
     // Fire `list_changed` subscribers on every doomed client BEFORE we
@@ -1943,7 +2090,9 @@ export class McpServerPool {
       try {
         // Ping with a 5-second timeout
         await client.client.ping({ timeout: 5000 });
-      } catch {
+      } catch (error) {
+        // A backend without `ping` answered: alive (see isPingAnsweredError).
+        if (isPingAnsweredError(error)) continue;
         // The ping can finish after getSession promoted this client to active
         // and filled idle with a replacement. Only retire the slot we pinged;
         // active clients have their own two-strike health policy below.
@@ -2048,7 +2197,10 @@ export class McpServerPool {
       const results = await Promise.allSettled(
         clients.map((c) => c.client.ping({ timeout: 5000 })),
       );
-      const deadCount = results.filter((r) => r.status === "rejected").length;
+      // An answered -32601 is a live connection (see isPingAnsweredError).
+      const deadCount = results.filter(
+        (r) => r.status === "rejected" && !isPingAnsweredError(r.reason),
+      ).length;
 
       if (deadCount === 0) {
         delete this.activePingFailures[serverUuid];

@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 
 import logger from "@/utils/logger";
 
+import { isPerUserBrokerError } from "../../m365/errors";
+import {
+  BACKEND_UNAVAILABLE,
+  isBackendUnavailableError,
+} from "../backend-unavailable";
 import { CallerContext, getCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
 import type { ToolArgSchema } from "../tool-arg-keys";
@@ -11,6 +16,7 @@ import {
   ArgsShape,
   argsShapeEnabled,
   buildArgsShape,
+  snapshotArgsForShape,
 } from "./audit-args-shape";
 import { CallVerdict, classifyCallResult } from "./audit-classify";
 import {
@@ -52,6 +58,15 @@ import { getRetiredToolInfo } from "./retired-tool-marker";
  * key names plus the value of a six-key allowlist of short enumerations
  * (audit-args-shape; the one deliberate exception to "no argument values").
  * An audit-write failure is swallowed and never fails or delays the tool call.
+ *
+ * DEFERRED SHAPE. When the routing instance has no schema for the called name
+ * and can list (`resolveMissingSchema`), the row is written after the call
+ * settles AND that instance's own listing settles (at most
+ * AUDIT_SCHEMA_WAIT_MS), from a snapshot of the arguments taken at entry. The
+ * call itself runs and answers exactly as before; only the fire-and-forget row
+ * waits. A listing that fails, times out or is skipped leaves the count-only
+ * shape computed at entry. Such a row carries `called_at` from the moment the
+ * call settled, so the wait does not move it.
  */
 
 type AuditRecorder = (entry: {
@@ -76,7 +91,21 @@ type AuditRecorder = (entry: {
   // `error_detail` is filled by the result classifier. NULL = not recorded.
   args_shape?: ArgsShape | null;
   error_detail?: string | null;
+  // Set only on a deferred-shape row (see DEFERRED SHAPE above); otherwise the
+  // column default (insert time, right after the call) applies as before.
+  called_at?: Date;
 }) => Promise<void>;
+
+/** Resolves a missing schema from the routing instance's own listing. */
+export type MissingSchemaResolver = (
+  name: string,
+) => Promise<ToolArgSchema | undefined> | undefined;
+
+/**
+ * Longest a row waits for the routing instance's listing. The listing goes on
+ * and serves later calls; this row keeps the count-only shape.
+ */
+export const AUDIT_SCHEMA_WAIT_MS = 15_000;
 
 /**
  * Pick the caller binding for this call, from ONE source.
@@ -150,6 +179,85 @@ function shapeOf(
       "Audit argument shape fault; recording the call without args_shape",
     );
     return null;
+  }
+}
+
+interface DeferredShape {
+  /** What `buildArgsShape` reads, captured at entry (snapshotArgsForShape). */
+  snapshot: unknown;
+  /** The entry shape (counts only), recorded when no schema arrives. */
+  fallback: ArgsShape;
+}
+
+/**
+ * The entry snapshot to shape once the routing instance has listed, or
+ * undefined when the entry shape is final: the kill switch is off, the schema
+ * was known, the path cannot list, or a schema would not change the shape (no
+ * keys, or not an object). `unverified_keys` is set exactly in the remaining
+ * case. Never throws.
+ */
+function deferShape(
+  args: unknown,
+  entryShape: ArgsShape | null,
+  canResolve: boolean,
+): DeferredShape | undefined {
+  if (!canResolve || entryShape?.unverified_keys === undefined) {
+    return undefined;
+  }
+  try {
+    return { snapshot: snapshotArgsForShape(args), fallback: entryShape };
+  } catch {
+    // Only a getter that throws on a second read gets here (shapeOf already
+    // read the arguments once). The count-only entry shape stands.
+    return undefined;
+  }
+}
+
+/** `promise`'s value, or undefined once `ms` pass or it rejects. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(undefined), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(undefined);
+      },
+    );
+  });
+}
+
+/**
+ * The shape for a deferred row. Checks the instance's registry again first (a
+ * client listing can land while the call runs), then waits a bounded time for
+ * the instance's own listing. Never rejects: any fault keeps the fallback.
+ */
+async function settleDeferredShape(
+  toolName: string,
+  deferred: DeferredShape,
+  schemaForTool: ((name: string) => ToolArgSchema | undefined) | undefined,
+  resolveMissingSchema: MissingSchemaResolver,
+): Promise<ArgsShape> {
+  try {
+    let schema = schemaForTool?.(toolName);
+    if (!schema) {
+      const pending = resolveMissingSchema(toolName);
+      if (!pending) return deferred.fallback;
+      schema = await within(pending, AUDIT_SCHEMA_WAIT_MS);
+    }
+    return schema
+      ? buildArgsShape(deferred.snapshot, schema)
+      : deferred.fallback;
+  } catch {
+    // Same discipline as shapeOf: never echo the fault.
+    logger.warn(
+      "Audit argument shape fault after the call; recording the call with the count-only args_shape",
+    );
+    return deferred.fallback;
   }
 }
 
@@ -227,6 +335,9 @@ function errorCode(error: unknown): string {
   // serves. Record it as the class `unknown_tool` instead of the JS class name
   // `Error`, so unmapped or mistyped tool names are measurable too.
   if (isUnknownToolError(error)) return "unknown_tool";
+  // A mounted server that could not be used: the tool was not run. Its own
+  // class, so a transient routing failure is never counted as a missing tool.
+  if (isBackendUnavailableError(error)) return BACKEND_UNAVAILABLE;
   if (error && typeof error === "object") {
     const code = (error as { code?: unknown }).code;
     if (typeof code === "number" || typeof code === "string") {
@@ -237,17 +348,39 @@ function errorCode(error: unknown): string {
   return "error";
 }
 
-function persist(entry: Parameters<AuditRecorder>[0]): void {
+function persist(
+  entry: Parameters<AuditRecorder>[0],
+  settleShape?: () => Promise<ArgsShape>,
+): void {
+  // Taken now, as the call settles, so a row that waits for a listing keeps
+  // the time it would have had.
+  const calledAt = settleShape ? new Date() : undefined;
   void resolveRecorder()
-    .then((recorder) => recorder?.(entry))
+    .then(async (recorder) => {
+      // No sink, no listing: the deferred lookup runs only for a row that
+      // will be written.
+      if (!recorder) return;
+      if (!settleShape) return recorder(entry);
+      return recorder({
+        ...entry,
+        args_shape: await settleShape(),
+        called_at: calledAt,
+      });
+    })
     .catch(() => {
       // Best-effort by design: an audit-write failure must never surface
       // into the tool call. Live Logs + stdout already carry the event.
     });
 }
 
+/**
+ * `schemaForTool` reads the routing instance's recorded schemas.
+ * `resolveMissingSchema`, when given, obtains a missing one from that
+ * instance's own listing after the call (see DEFERRED SHAPE above).
+ */
 export function createAuditingMiddleware(
   schemaForTool?: (name: string) => ToolArgSchema | undefined,
+  resolveMissingSchema?: MissingSchemaResolver,
 ): CallToolMiddleware {
   return (handler) => async (request, context) => {
     const start = performance.now();
@@ -275,12 +408,28 @@ export function createAuditingMiddleware(
     // Computed here, from the arguments as the caller sent them, before any
     // inner middleware (which builds a rewritten request) or the handler runs.
     // Only the routing instance's own published listing can verify these names.
-    // Paths without that snapshot (OpenAPI) deliberately store counts only.
+    // Without a recorded schema this is the count-only shape; a path that can
+    // list shapes the entry snapshot again once it has (DEFERRED SHAPE).
     const argsShape = shapeOf(
       fullName,
       request.params.arguments,
       schemaForTool,
     );
+    const deferred = deferShape(
+      request.params.arguments,
+      argsShape,
+      resolveMissingSchema !== undefined,
+    );
+    const settleShape =
+      deferred && resolveMissingSchema
+        ? () =>
+            settleDeferredShape(
+              fullName,
+              deferred,
+              schemaForTool,
+              resolveMissingSchema,
+            )
+        : undefined;
 
     try {
       const result = await handler(request, context);
@@ -310,51 +459,66 @@ export function createAuditingMiddleware(
         durationMs,
         clientName,
       });
-      persist({
-        client_name: clientName ?? null,
-        namespace_uuid: context.namespaceUuid ?? null,
-        session_id: context.sessionId ?? null,
-        server_name: serverName,
-        tool_name: toolName,
-        params_hash: paramsHash,
-        success: !failed,
-        // A class from a small fixed vocabulary, never the result's text: the
-        // MCP shape carries the reason as human text in `content`, which is not
-        // something to put in a column. The class stays queryable and distinct
-        // from the protocol-level codes the catch branch records; the tool's
-        // own code token (when it gave one) rides `error_detail`.
-        error_code: failed ? verdict.errorCode : undefined,
-        error_detail: failed ? verdict.errorDetail : undefined,
-        latency_ms: durationMs,
-        args_shape: argsShape,
-        ...caller,
-      });
+      persist(
+        {
+          client_name: clientName ?? null,
+          namespace_uuid: context.namespaceUuid ?? null,
+          session_id: context.sessionId ?? null,
+          server_name: serverName,
+          tool_name: toolName,
+          params_hash: paramsHash,
+          success: !failed,
+          // A class from a small fixed vocabulary, never the result's text: the
+          // MCP shape carries the reason as human text in `content`, which is not
+          // something to put in a column. The class stays queryable and distinct
+          // from the protocol-level codes the catch branch records; the tool's
+          // own code token (when it gave one) rides `error_detail`.
+          error_code: failed ? verdict.errorCode : undefined,
+          error_detail: failed ? verdict.errorDetail : undefined,
+          latency_ms: durationMs,
+          args_shape: argsShape,
+          ...caller,
+        },
+        settleShape,
+      );
       return result;
     } catch (error) {
       const durationMs = Math.round(performance.now() - start);
+      // A caller whose own Microsoft 365 enrollment is missing, expired,
+      // revoked or MFA-gated gets the enroll-URL result from the proxy one
+      // level up; that is an expected user state, not a tool fault, so it is
+      // a WARN without a stack here. The audit row below still records the
+      // call as failed with the broker code. Operator-actionable broker
+      // errors (not_configured, mint_failed) and everything else stay ERROR.
+      const enrollmentRefusal = isPerUserBrokerError(error);
       metamcpLogStore.record({
         category: "tool_call",
         serverName,
-        level: "error",
-        message: `${toolName} failed (${durationMs}ms)`,
+        level: enrollmentRefusal ? "warn" : "error",
+        message: enrollmentRefusal
+          ? `${toolName} refused: the caller's Microsoft 365 enrollment is needed (${errorCode(error)}, ${durationMs}ms)`
+          : `${toolName} failed (${durationMs}ms)`,
         toolName,
         durationMs,
         clientName,
-        error,
+        ...(enrollmentRefusal ? {} : { error }),
       });
-      persist({
-        client_name: clientName ?? null,
-        namespace_uuid: context.namespaceUuid ?? null,
-        session_id: context.sessionId ?? null,
-        server_name: serverName,
-        tool_name: toolName,
-        params_hash: paramsHash,
-        success: false,
-        error_code: errorCode(error),
-        latency_ms: durationMs,
-        args_shape: argsShape,
-        ...caller,
-      });
+      persist(
+        {
+          client_name: clientName ?? null,
+          namespace_uuid: context.namespaceUuid ?? null,
+          session_id: context.sessionId ?? null,
+          server_name: serverName,
+          tool_name: toolName,
+          params_hash: paramsHash,
+          success: false,
+          error_code: errorCode(error),
+          latency_ms: durationMs,
+          args_shape: argsShape,
+          ...caller,
+        },
+        settleShape,
+      );
       throw error;
     }
   };

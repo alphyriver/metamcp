@@ -5,10 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import logger from "@/utils/logger";
 
+import { M365BrokerError } from "../../m365/errors";
+import { BackendUnavailableError } from "../backend-unavailable";
 import { runWithCallerContext } from "../caller-context-store";
 import { metamcpLogStore } from "../log-store";
-import { ToolArgSchemaRegistry } from "../tool-arg-keys";
+import { type ToolArgSchema, ToolArgSchemaRegistry } from "../tool-arg-keys";
 import {
+  AUDIT_SCHEMA_WAIT_MS,
   createAuditingMiddleware,
   setAuditRecorderForTesting,
 } from "./auditing.functional";
@@ -693,6 +696,26 @@ describe("in-band classification (migration 0039 error_detail)", () => {
     expect(entry.error_code).toBe("unknown_tool");
   });
 
+  it("records a thrown backend-unavailable as its own class, never unknown_tool, and rethrows it", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const unavailable = new BackendUnavailableError(
+      "gamma__run_report",
+      "gamma",
+      "no_session",
+    );
+
+    const wrapped = auditing()(vi.fn().mockRejectedValue(unavailable));
+    await expect(wrapped(makeRequest({ a: 1 }), context)).rejects.toBe(
+      unavailable,
+    );
+    await flush();
+
+    const entry = recorder.mock.calls[0][0];
+    expect(entry.success).toBe(false);
+    expect(entry.error_code).toBe("backend_unavailable");
+  });
+
   it("any other thrown error keeps its original class", async () => {
     const recorder = vi.fn().mockResolvedValue(undefined);
     setAuditRecorderForTesting(recorder);
@@ -880,6 +903,85 @@ describe("in-band classification (migration 0039 error_detail)", () => {
       expect(DASHBOARD_ERROR_WORDS.test(second.message)).toBe(false);
     });
 
+    it("a caller's own m365 enrollment refusal logs at warn, no stack, still audited and rethrown", async () => {
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+      const spy = recordSpy().mockImplementation(() => undefined);
+
+      for (const code of [
+        "credential_missing",
+        "credential_expired",
+        "credential_revoked",
+        "mfa_required",
+      ] as const) {
+        const refusal = new M365BrokerError(
+          code,
+          "No Microsoft 365 account is connected for your user yet.",
+          "https://enroll.example/m365/enroll",
+        );
+        await expect(
+          auditing()(vi.fn().mockRejectedValue(refusal))(
+            makeRequest({ a: 1 }),
+            context,
+          ),
+        ).rejects.toBe(refusal);
+      }
+      await flush();
+
+      const logged = spy.mock.calls.map((call) => call[0]);
+      expect(logged).toHaveLength(4);
+      for (const line of logged) {
+        expect(line.level).toBe("warn");
+        expect(line.error).toBeUndefined();
+        expect(line.message).toMatch(
+          /^search refused: the caller's Microsoft 365 enrollment is needed \((credential_missing|credential_expired|credential_revoked|mfa_required), \d+ms\)$/,
+        );
+        expect(DASHBOARD_ERROR_WORDS.test(line.message)).toBe(false);
+      }
+      const rows = recorder.mock.calls.map((call) => call[0]);
+      expect(rows.map((row) => [row.success, row.error_code])).toEqual([
+        [false, "credential_missing"],
+        [false, "credential_expired"],
+        [false, "credential_revoked"],
+        [false, "mfa_required"],
+      ]);
+    });
+
+    it("an operator-actionable broker error and any other throw stay at error with the error attached", async () => {
+      setAuditRecorderForTesting(null);
+      const spy = recordSpy().mockImplementation(() => undefined);
+      const notConfigured = new M365BrokerError(
+        "not_configured",
+        "broker not configured",
+      );
+      const mintFailed = new M365BrokerError("mint_failed", "mint failed");
+      const plain = new Error("terminated");
+
+      for (const thrown of [notConfigured, mintFailed, plain]) {
+        await expect(
+          auditing()(vi.fn().mockRejectedValue(thrown))(
+            makeRequest({ a: 1 }),
+            context,
+          ),
+        ).rejects.toBe(thrown);
+      }
+
+      const logged = spy.mock.calls.map((call) => call[0]);
+      expect(logged.map((line) => line.level)).toEqual([
+        "error",
+        "error",
+        "error",
+      ]);
+      expect(logged.map((line) => line.error)).toEqual([
+        notConfigured,
+        mintFailed,
+        plain,
+      ]);
+      for (const line of logged) {
+        expect(line.message).toMatch(/^search failed \(\d+ms\)$/);
+      }
+    });
+
     it("isError results keep the original error level and text", async () => {
       setAuditRecorderForTesting(null);
       const spy = recordSpy().mockImplementation(() => undefined);
@@ -906,5 +1008,185 @@ describe("in-band classification (migration 0039 error_detail)", () => {
       expect(logged.level).toBe("info");
       expect(logged.message).toMatch(/^search \(\d+ms\)$/);
     });
+  });
+});
+
+describe("deferred shape: a routing instance that lists for its own audit", () => {
+  // A registry that holds nothing until the resolver's listing fills it, as a
+  // proxy that was never listed on does.
+  const UNLISTED = "autotask__ticket_context";
+  const listed = new ToolArgSchemaRegistry();
+  const fill = () =>
+    listed.replace([
+      {
+        name: UNLISTED,
+        inputSchema: {
+          type: "object",
+          properties: { mode: { enum: ["summary"] }, ticket: {} },
+        },
+      },
+    ]);
+  const requestFor = (args: unknown): CallToolRequest =>
+    ({
+      method: "tools/call",
+      params: { name: UNLISTED, arguments: args },
+    }) as CallToolRequest;
+  const deferredAuditing = (
+    resolve: (name: string) => Promise<ToolArgSchema | undefined> | undefined,
+  ) => createAuditingMiddleware((name) => listed.get(name), resolve);
+
+  beforeEach(() => {
+    listed.replace([]);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("the call answers first with the same object; the row waits for the listing and keeps the call's time", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    let finish!: () => void;
+    const listing = new Promise<void>((r) => {
+      finish = r;
+    });
+    const resolve = vi.fn(async (name: string) => {
+      await listing;
+      fill();
+      return listed.get(name);
+    });
+    const result = { content: [{ type: "text", text: "ok" }] };
+    const handler = vi.fn().mockResolvedValue(result);
+
+    const answered = await deferredAuditing(resolve)(handler)(
+      requestFor({ mode: "summary", ticket: 7, Alice_Smith: 1 }),
+      context,
+    );
+
+    expect(answered).toBe(result);
+    await flush();
+    expect(resolve).toHaveBeenCalledWith(UNLISTED);
+    expect(recorder).not.toHaveBeenCalled();
+    finish();
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    const row = recorder.mock.calls[0][0];
+    expect(row.args_shape).toEqual({
+      keys: ["mode", "ticket"],
+      sel: { mode: "summary" },
+      unknown_keys: 1,
+    });
+    expect(row.called_at).toBeInstanceOf(Date);
+    expect(row.success).toBe(true);
+  });
+
+  it("the shape comes from the arguments as sent, even if they change after entry", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const args: Record<string, unknown> = { mode: "summary", ticket: 7 };
+    const handler = vi.fn(async () => {
+      args.mode = "Alice_Smith";
+      args.Alice_Smith = 1;
+      return { content: [] };
+    });
+    await deferredAuditing(async (name) => {
+      fill();
+      return listed.get(name);
+    })(handler)(requestFor(args), context);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: ["mode", "ticket"],
+      sel: { mode: "summary" },
+    });
+  });
+
+  it.each([
+    ["no listing may start", () => undefined],
+    ["the listing finds no schema", async () => undefined],
+    [
+      "the listing rejects",
+      async () => {
+        throw new Error("listing failed");
+      },
+    ],
+  ])("%s: the row keeps the count-only shape", async (_label, resolve) => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    await deferredAuditing(resolve)(okHandler)(
+      requestFor({ mode: "summary", ticket: 7 }),
+      context,
+    );
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 2,
+    });
+  });
+
+  it("a listing that never settles leaves the count-only shape after the wait bound", async () => {
+    vi.useFakeTimers();
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    await deferredAuditing(() => new Promise(() => undefined))(okHandler)(
+      requestFor({ mode: "summary" }),
+      context,
+    );
+    await vi.advanceTimersByTimeAsync(AUDIT_SCHEMA_WAIT_MS - 1);
+    expect(recorder).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(recorder).toHaveBeenCalledTimes(1);
+    expect(recorder.mock.calls[0][0].args_shape).toEqual({
+      keys: [],
+      unverified_keys: 1,
+    });
+  });
+
+  it("a thrown call is deferred the same way and rethrown as the same object", async () => {
+    const recorder = vi.fn().mockResolvedValue(undefined);
+    setAuditRecorderForTesting(recorder);
+    const failure = new Error("backend said no");
+    await expect(
+      deferredAuditing(async (name) => {
+        fill();
+        return listed.get(name);
+      })(vi.fn().mockRejectedValue(failure))(
+        requestFor({ mode: "summary" }),
+        context,
+      ),
+    ).rejects.toBe(failure);
+    await vi.waitFor(() => expect(recorder).toHaveBeenCalledTimes(1));
+    expect(recorder.mock.calls[0][0]).toMatchObject({
+      success: false,
+      args_shape: { keys: ["mode"], sel: { mode: "summary" } },
+    });
+  });
+
+  it.each([
+    ["a known schema", true, { mode: "summary" }],
+    ["no arguments", false, undefined],
+    ["empty arguments", false, {}],
+    ["non-object arguments", false, ["summary"]],
+  ])(
+    "%s needs no listing and writes the row at once",
+    async (_label, known, args) => {
+      if (known) fill();
+      const recorder = vi.fn().mockResolvedValue(undefined);
+      setAuditRecorderForTesting(recorder);
+      const resolve = vi.fn(() => undefined);
+      await deferredAuditing(resolve)(okHandler)(requestFor(args), context);
+      await flush();
+      expect(resolve).not.toHaveBeenCalled();
+      expect(recorder).toHaveBeenCalledTimes(1);
+      expect(recorder.mock.calls[0][0].called_at).toBeUndefined();
+    },
+  );
+
+  it("with no audit sink nothing is listed", async () => {
+    setAuditRecorderForTesting(null);
+    const resolve = vi.fn(() => undefined);
+    await deferredAuditing(resolve)(okHandler)(
+      requestFor({ mode: "summary" }),
+      context,
+    );
+    await flush();
+    expect(resolve).not.toHaveBeenCalled();
   });
 });

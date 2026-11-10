@@ -39,6 +39,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Least privilege: every job declares its own permissions; this default
+# covers any job added later without a block.
+permissions:
+  contents: read
+
 jobs:
   # NOTE: this workflow builds, tags and releases the image. Tests and
   # check-types run in umbrella-ci.yml, on the same push/PR-to-`umbrella`
@@ -128,8 +133,34 @@ jobs:
           git tag -a "${{ steps.version.outputs.value }}" "$GITHUB_SHA" -m "MetaMCP ${{ steps.version.outputs.value }}"
           git push origin "${{ steps.version.outputs.value }}"
 
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+      # Attestation talks to Sigstore (Fulcio and the Rekor transparency log),
+      # which answers an occasional transient 500. Run 578 failed only here with
+      # `error creating tlog entry - (500) unexpected result from transparency
+      # log` after the image was built and pushed, and the next run passed. The
+      # first attempt therefore must not fail the job on its own: it is
+      # `continue-on-error`, and the step after it retries once, only if this one
+      # failed. A persistent failure still fails the job (the retry has no
+      # `continue-on-error`). Nothing in the deploy verifies attestations (the
+      # gateway is digest-pinned), so a lost attestation costs provenance, not
+      # availability, which is why one retry is the bound. Same action pin on both.
+      - id: attest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         if: github.event_name != 'pull_request'
+        continue-on-error: true
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Wait before retrying attestation
+        if: github.event_name != 'pull_request' && steps.attest.outcome == 'failure'
+        run: |
+          echo "::warning::attest-build-provenance failed (Sigstore transient?); retrying once in 30s"
+          sleep 30
+
+      - name: Attest build provenance (retry)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        if: github.event_name != 'pull_request' && steps.attest.outcome == 'failure'
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
