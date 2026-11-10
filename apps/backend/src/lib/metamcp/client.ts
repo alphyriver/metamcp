@@ -13,18 +13,24 @@ import logger from "@/utils/logger";
 
 import {
   isM365BrokerError,
+  isPerUserBrokerError,
   M365BrokerError,
   M365BrokerErrorCode,
 } from "../m365/errors";
 import { getInjectedFetchForServer } from "../m365/injected-fetch";
 import { recordConnectBrokerFailure } from "../m365/request-context";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
+import { ASSERTED_ACTOR_HEADER, withAssertedActor } from "./asserted-actor";
 import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
 import { resolveServerBearerToken } from "./server-bearer-crypto";
 import { serverErrorTracker } from "./server-error-tracker";
 import { createGuardedFetch } from "./url-guard";
 import { resolveEnvVariables } from "./utils";
+import {
+  getVerifiedCallerFetchForServer,
+  VERIFIED_CALLER_HEADER,
+} from "./verified-caller";
 
 const sleep = (time: number) =>
   new Promise<void>((resolve) => setTimeout(() => resolve(), time));
@@ -166,6 +172,14 @@ export const TRANSPORT_START_TIMEOUT_MS = 30_000;
  * The SDK ships `terminateSession()` for exactly this, but its only call
  * site was the admin-only Inspector DELETE route — never the production
  * pool.
+ *
+ * THE DELETE CARRIES NO USER TOKEN. For an injected server (`m365`) the
+ * DELETE goes through the same per-user fetch as every request, and that
+ * fetch mints a token only for a request that can execute a tool
+ * (`m365/injected-fetch.ts`, invariant 5). So a user with no usable grant
+ * cannot make this DELETE throw: it used to, which left the backend session
+ * behind (the leak above) once per failed connect. Any OTHER failure here
+ * (a hung or gone backend, an error status) is still the one WARN below.
  *
  * FAIL-OPEN BY DESIGN: a backend that is unreachable, hung, or answers
  * the DELETE with an error must never block or abort pool eviction, so
@@ -346,11 +360,24 @@ export const transformDockerUrl = (url: string): string => {
  * SSRF vector this closes. The response byte ceiling and idle timeout come
  * from the guard defaults (MCP_PROXY_MAX_RESPONSE_BYTES,
  * MCP_PROXY_REQUEST_TIMEOUT_MS).
+ *
+ * `internalOnlyHeaders` keeps the caller-asserted `x-mcp-actor`, which
+ * `withAssertedActor` puts on each pooled request, off any destination that is
+ * not internal (see `asserted-actor.ts`). The same holds for
+ * `x-umbrella-user-id`, the verified caller's user id that
+ * `withVerifiedCaller` sets for the backends named in
+ * VERIFIED_CALLER_SERVER_NAMES and the m365 injection sets for its own
+ * backends (see `verified-caller.ts`): a person's account id never reaches a
+ * third-party server. `dropOnMethodRewriteHeaders` removes that id when a
+ * same-origin 301, 302 or 303 turns a tool POST into a GET, because the GET
+ * executes nothing on the caller's behalf.
  */
 const createPoolGuardedFetch = (): FetchLike =>
   createGuardedFetch({
     allowPrivateAddresses: true,
     refuseCrossOriginRedirect: true,
+    internalOnlyHeaders: [ASSERTED_ACTOR_HEADER, VERIFIED_CALLER_HEADER],
+    dropOnMethodRewriteHeaders: [VERIFIED_CALLER_HEADER],
   });
 
 export const createMetaMcpClient = (
@@ -423,15 +450,26 @@ export const createMetaMcpClient = (
     // remote-controlled input the pool never sees otherwise. eventSourceInit
     // .fetch takes precedence over the `fetch` option inside the SDK, so both
     // are set for the stream GET and the back-channel POSTs to be covered.
-    const guardedFetch = createPoolGuardedFetch();
+    // `withAssertedActor` stamps each request with the X-MCP-Actor of the
+    // inbound request it serves (the back-channel POST carries the tool call).
+    // For a server named in VERIFIED_CALLER_SERVER_NAMES the verified-caller
+    // wrapper strips any X-Umbrella-User-Id and sets the authenticated
+    // caller's id on tool calls; every other server gets the guarded fetch
+    // itself. See `verified-caller.ts`.
+    const poolFetch = withAssertedActor(
+      getVerifiedCallerFetchForServer(
+        serverParams.name,
+        createPoolGuardedFetch(),
+      ),
+    );
     transport = new SSEClientTransport(new URL(transformedUrl), {
       eventSourceInit: {
-        fetch: (url, init) => guardedFetch(url, { ...init, headers }),
+        fetch: (url, init) => poolFetch(url, { ...init, headers }),
       },
       requestInit: {
         headers,
       },
-      fetch: guardedFetch,
+      fetch: poolFetch,
     });
   } else if (serverParams.type === "STREAMABLE_HTTP" && serverParams.url) {
     // Transform the URL if TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL is set to "true"
@@ -462,8 +500,9 @@ export const createMetaMcpClient = (
 
     // M365 delegated broker: servers configured for per-user Graph token
     // injection get a fetch that stamps a freshly minted per-user
-    // Authorization onto EVERY outgoing request (and strips any
-    // connection-level credential), request-scoped so it survives pool
+    // Authorization onto requests that can execute backend code, while
+    // the handshake, listings, stream and teardown stay token-free. It
+    // strips any connection-level credential, request-scoped so it survives pool
     // idle-handoff/cap-reuse without cross-user token leakage. It wraps the
     // guarded fetch: injection sets the header, then the guarded fetch
     // validates + pins + caps the actual connection. See
@@ -473,11 +512,27 @@ export const createMetaMcpClient = (
       guardedFetch,
     );
 
+    // Verified caller: for a server named in VERIFIED_CALLER_SERVER_NAMES,
+    // strip any X-Umbrella-User-Id (a stored row header included) and set the
+    // authenticated caller's user id on requests that can execute a tool.
+    // Every other server gets its fetch back untouched. For a named server
+    // `injectedFetch` is always undefined, because a server in both lists is
+    // refused at boot and again here. See `verified-caller.ts`.
+    //
+    // Outermost: the caller-asserted X-MCP-Actor of the inbound request this
+    // request serves, read at send time from the request-scoped binding so a
+    // pooled connection never carries one caller's label on another's call.
+    // See `asserted-actor.ts`.
     transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
       requestInit: {
         headers,
       },
-      fetch: injectedFetch ?? guardedFetch,
+      fetch: withAssertedActor(
+        getVerifiedCallerFetchForServer(
+          serverParams.name,
+          injectedFetch ?? guardedFetch,
+        ),
+      ),
     });
   } else {
     metamcpLogStore.addLog(
@@ -519,28 +574,48 @@ export interface ConnectMetaMcpClientDeps {
 }
 
 /**
- * M365 broker codes that represent a DETERMINISTIC per-user identity
- * rejection on the connect-time mint — retrying can never change this
- * user's outcome, so a connect that hits one of these short-circuits to a
- * single attempt (see the catch block below). Deliberately every code
- * EXCEPT `mint_failed`: mint-service throws `mint_failed` for TRANSIENT
- * operational failures — the token-endpoint being unreachable
- * (mint-service.ts's network-error catch) or answering 5xx / a
- * non-grant error (mint-service.ts's `classifyRefreshFailure`, the
+ * Whether a connect whose connect-time mint failed with each M365 broker
+ * code is retried. BACKSTOP for `m365`: its `initialize` no longer mints
+ * (`m365/injected-fetch.ts`, invariant 5), so a connect to it cannot fail on
+ * a broker error today. This stays for any other injected server, and so
+ * that a mint on the handshake can never come back as a retry storm.
+ * `false` marks a DETERMINISTIC per-user identity
+ * rejection — retrying can never change this user's outcome, so a connect
+ * that hits one short-circuits to a single attempt (see the catch block
+ * below). Deliberately every code EXCEPT `mint_failed`: mint-service throws
+ * `mint_failed` for TRANSIENT operational failures — the token-endpoint
+ * being unreachable (mint-service.ts's network-error catch) or answering
+ * 5xx / a non-grant error (mint-service.ts's `classifyRefreshFailure`, the
  * ">=500 || !body.error" and "invalid_client/invalid_request" branches).
  * Pre-Track-A5 those retried with the normal backoff schedule — free
  * resilience against a brief Entra blip — and that must be preserved, not
  * collapsed into the same one-attempt short-circuit as the deterministic
  * codes.
+ *
+ * A Record over the whole `M365BrokerErrorCode` union rather than a Set of
+ * the non-retryable codes, so a code added to the union fails the type
+ * check here until its retry class is decided. A Set gave a new code no
+ * entry, which silently made it retryable: the safe direction, but a
+ * deterministic refusal would then cost every connect three attempts and a
+ * retry storm in the log.
  */
+const M365_BROKER_CODE_RETRYABLE: Readonly<
+  Record<M365BrokerErrorCode, boolean>
+> = {
+  credential_missing: false,
+  credential_expired: false,
+  credential_revoked: false,
+  mfa_required: false,
+  not_configured: false,
+  mint_failed: true,
+};
+
 const NON_RETRYABLE_M365_BROKER_CODES: ReadonlySet<M365BrokerErrorCode> =
-  new Set([
-    "credential_missing",
-    "credential_expired",
-    "credential_revoked",
-    "mfa_required",
-    "not_configured",
-  ]);
+  new Set(
+    (Object.keys(M365_BROKER_CODE_RETRYABLE) as M365BrokerErrorCode[]).filter(
+      (code) => !M365_BROKER_CODE_RETRYABLE[code],
+    ),
+  );
 
 export const connectMetaMcpClient = async (
   serverParams: ServerParameters,
@@ -693,6 +768,35 @@ export const connectMetaMcpClient = async (
           if (closing || connectedAt === undefined) {
             return;
           }
+          // A typed M365 broker refusal is the answer to ONE request (the
+          // injected fetch throws it before any byte leaves, for a tools/call
+          // whose user has no usable grant), not a fault of the backend. The
+          // SDK still reports every failed send here (`send()`,
+          // `terminateSession()` and the GET stream all call `onerror` and
+          // then rethrow), so without this return a refusal ran the whole
+          // drop path below: a WARN, `onTransportDrop`, invalidation of every
+          // session's pooled connection for the server and a list_changed
+          // fan-out, all because one user had not enrolled. The caller still
+          // gets the typed error, so the proxy answers the consumer with the
+          // enrollment prompt and logs the one refusal line. A genuine drop
+          // (a plain "terminated", ECONNREFUSED, a 5xx, "Connection closed")
+          // is not a broker error and falls through unchanged.
+          if (isM365BrokerError(transportError)) {
+            if (isPerUserBrokerError(transportError)) {
+              // The user's own enrollment state; the proxy's refusal line is
+              // the single INFO signal for it.
+              logger.debug(
+                `M365 broker refused a request for server ${serverParams.name} (${serverParams.uuid}) (${transportError.code}); the user's own enrollment state, not a backend drop`,
+              );
+            } else {
+              // not_configured / mint_failed: an operator-actionable fault.
+              logger.warn(
+                `M365 broker refused a request (${transportError.code}); not a backend drop. Server ${serverParams.name} (${serverParams.uuid}):`,
+                transportError,
+              );
+            }
+            return;
+          }
           const age = formatConnectionAge(connectedAt);
           const detail = describeConnectError(transportError);
           logger.warn(
@@ -828,6 +932,10 @@ export const connectMetaMcpClient = async (
       if (nonRetryableBroker) {
         // brokerError is narrowed non-undefined by nonRetryableBroker.
         const deterministicError = brokerError as M365BrokerError;
+        // BACKSTOP: for `m365` the handshake mints nothing, so a connect
+        // cannot reach this branch for it any more (the refusal now arrives
+        // on the tools/call itself). It is kept for any other injected
+        // server and for a future handshake that mints.
         // A DETERMINISTIC per-user identity state, not a backend fault.
         // Retrying can never resolve it and only produces the
         // "Connect attempt N/N failed" storm the operator saw, so

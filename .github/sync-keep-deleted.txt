@@ -1,0 +1,9 @@
+# Paths this fork deleted on purpose. When Umbrella upstream changes one of
+# them, the weekly sync (upstream-sync.yml) keeps it deleted instead of failing
+# on a modify/delete conflict. Only modify/delete conflicts on these exact paths
+# are resolved; every other conflict still opens a reconciliation PR.
+#
+# Removed 2026-07-16 (dec0172): umbrella-build.yml builds and releases this
+# fork's image; upstream's publishes to Umbrella's registry. It conflicted
+# every week from 2026-10-18 to 2026-11-08.
+.github/workflows/docker-publish.yml

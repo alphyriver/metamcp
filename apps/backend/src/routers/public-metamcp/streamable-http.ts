@@ -1,6 +1,16 @@
 import { randomUUID } from "node:crypto";
 
+import { MAX_BATCH_SIZE } from "@modelcontextprotocol/sdk/server/requestBody.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isJsonContentType } from "@modelcontextprotocol/sdk/shared/mediaType.js";
+import {
+  ErrorCode,
+  isInitializeRequest,
+  isJSONRPCRequest,
+  JSONRPCMessageSchema,
+  type RequestId,
+  SUPPORTED_PROTOCOL_VERSIONS,
+} from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 
 import {
@@ -41,7 +51,10 @@ import {
   MCP_REQUEST_BODY_LIMIT_BYTES,
   refuseDeclaredOversize,
 } from "../../lib/metamcp/mcp-request-body-limit";
-import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
+import {
+  type MetaMcpServerInstance,
+  metaMcpServerPool,
+} from "../../lib/metamcp/metamcp-server-pool";
 import {
   AuthMethod,
   hashAuthPrincipal,
@@ -464,6 +477,10 @@ export async function dispatchTracked(
   res: express.Response,
   sessionId: string,
   clientName?: string,
+  // The request body, when the route has already read it (a session-less
+  // POST, see `prereadSessionlessPost`). Undefined means the transport reads
+  // the body itself, as it does on every other leg.
+  parsedBody?: unknown,
 ): Promise<void> {
   publicSessionSweeper.markInFlight(sessionId);
   try {
@@ -475,7 +492,8 @@ export async function dispatchTracked(
     // one. See `lib/metamcp/caller-context-store`.
     await runWithCallerContext(
       { ...resolveCallerContext(authReq), clientName },
-      () => handleRequestWithUserContext(authReq, transport, req, res),
+      () =>
+        handleRequestWithUserContext(authReq, transport, req, res, parsedBody),
     );
   } finally {
     publicSessionSweeper.markSettled(sessionId);
@@ -514,6 +532,7 @@ function handleRequestWithUserContext(
   transport: StreamableHTTPServerTransport,
   req: express.Request,
   res: express.Response,
+  parsedBody?: unknown,
 ): Promise<void> {
   const context =
     authReq.authMethod === "oauth" && authReq.oauthUserId
@@ -521,8 +540,9 @@ function handleRequestWithUserContext(
       : authReq.authMethod === "api_key" && authReq.apiKeyActsAsUserId
         ? { userId: authReq.apiKeyActsAsUserId }
         : undefined;
+  // The SDK reads the body itself only when `parsedBody` is undefined.
   return runWithM365UserContext(context, () =>
-    transport.handleRequest(req, res),
+    transport.handleRequest(req, res, parsedBody),
   );
 }
 
@@ -868,74 +888,144 @@ async function rebuildRecoveredTransport(
     );
     return { status: "not_found" };
   }
-  // Re-stamp the consumer identity onto the rebuilt instance's context so
-  // post-restart tool calls stay attributed (the registry/in-memory state is
-  // gone after a restart; authReq is the re-validated current caller).
-  stampCallerContext(mcpServerInstance.handlerContext, authReq, clientName);
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => sessionId,
-    // The same body ceiling as a fresh session: a recovered session carries
-    // the same tool calls. See lib/metamcp/mcp-request-body-limit.
-    maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
-    onsessioninitialized: async (sid) => {
-      logger.info(
-        `Lazy-recovered session re-initialized for sessionId: ${sid}`,
-      );
-    },
-  });
-  await mcpServerInstance.server.connect(transport);
+  // From here the pools hold an instance (and its backend connections) under
+  // this session id. Every exit that does not register the session must give
+  // it back, or it stays allocated with nothing to release it: no transport
+  // is resident to be DELETEd, swept or evicted, and the next recovery of the
+  // same id is handed the same instance by `getServer` (keyed by session id),
+  // whose `server.connect` then throws because it is still connected.
+  let registered = false;
+  try {
+    // Re-stamp the consumer identity onto the rebuilt instance's context so
+    // post-restart tool calls stay attributed (the registry/in-memory state is
+    // gone after a restart; authReq is the re-validated current caller).
+    stampCallerContext(mcpServerInstance.handlerContext, authReq, clientName);
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => sessionId,
+      // The same body ceiling as a fresh session: a recovered session carries
+      // the same tool calls. See lib/metamcp/mcp-request-body-limit.
+      maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
+      onsessioninitialized: async (sid) => {
+        logger.info(
+          `Lazy-recovered session re-initialized for sessionId: ${sid}`,
+        );
+      },
+    });
+    await mcpServerInstance.server.connect(transport);
 
-  // Restore the SDK session state the (skipped) `initialize` handshake
-  // would have set. Without this the rebuilt transport stays
-  // `_initialized=false` and rejects the client's first request with
-  // 400 {-32000 "Server not initialized"} → relayed as -32600. See
-  // `hydrateRecoveredTransport` for the full rationale.
-  if (!hydrateRecoveredTransport(transport, sessionId)) {
-    // SDK internal shape changed — don't cache a transport we can't
-    // prove is serviceable. Fall back to the 404 reinit path.
-    await transport
-      .close()
+    // Restore the SDK session state the (skipped) `initialize` handshake
+    // would have set. Without this the rebuilt transport stays
+    // `_initialized=false` and rejects the client's first request with
+    // 400 {-32000 "Server not initialized"} → relayed as -32600. See
+    // `hydrateRecoveredTransport` for the full rationale.
+    if (!hydrateRecoveredTransport(transport, sessionId)) {
+      // SDK internal shape changed — don't cache a transport we can't
+      // prove is serviceable. Fall back to the 404 reinit path.
+      await transport
+        .close()
+        .catch((error: unknown) =>
+          logger.warn(
+            `Failed to close un-hydratable recovered transport for session ${sessionId}.`,
+            error,
+          ),
+        );
+      return { status: "not_found" };
+    }
+    // Bind the recovered session to its endpoint and to the caller. The row
+    // already passed the namespace_uuid + endpoint_name match AND the
+    // auth_method + auth_principal comparison above, so this request's endpoint
+    // and identity ARE the session's true binding — record them so subsequent
+    // in-memory lookups go through the same check as the fresh-session path.
+    // Recording the recovering caller's identity is not a rebind: recovery is
+    // only reached with the credential whose hash the row already stores.
+    sessionManager.addSession(sessionId, transport, requestBinding(authReq));
+    registered = true;
+    // Registration replaces the ceiling's reservation synchronously.
+    onRegistered?.();
+    // Resume idle-TTL tracking for the recovered session. Required whether
+    // this recovery followed a sweep reap (the reap's forget() dropped
+    // tracking; without this the recovered session would never be
+    // TTL-swept again if abandoned a second time) or a gateway restart (the
+    // sweeper's in-memory map is empty after boot regardless of cause).
+    // beginTracking() is the unconditional seed — see its doc comment for
+    // why touch()/markInFlight() further down (in dispatchTracked) are
+    // deliberately guarded and would no-op here without this call.
+    publicSessionSweeper.beginTracking(sessionId);
+    // Best-effort touch; failure is non-fatal — pruner only deletes
+    // genuinely stale rows.
+    mcpSessionsRepository
+      .touch(sessionId)
       .catch((error: unknown) =>
         logger.warn(
-          `Failed to close un-hydratable recovered transport for session ${sessionId}.`,
+          `mcp_sessions touch failed for session ${sessionId}; pruner may reap prematurely.`,
           error,
         ),
       );
-    return { status: "not_found" };
-  }
-  // Bind the recovered session to its endpoint and to the caller. The row
-  // already passed the namespace_uuid + endpoint_name match AND the
-  // auth_method + auth_principal comparison above, so this request's endpoint
-  // and identity ARE the session's true binding — record them so subsequent
-  // in-memory lookups go through the same check as the fresh-session path.
-  // Recording the recovering caller's identity is not a rebind: recovery is
-  // only reached with the credential whose hash the row already stores.
-  sessionManager.addSession(sessionId, transport, requestBinding(authReq));
-  // Registration replaces the ceiling's reservation synchronously.
-  onRegistered?.();
-  // Resume idle-TTL tracking for the recovered session. Required whether
-  // this recovery followed a sweep reap (the reap's forget() dropped
-  // tracking; without this the recovered session would never be
-  // TTL-swept again if abandoned a second time) or a gateway restart (the
-  // sweeper's in-memory map is empty after boot regardless of cause).
-  // beginTracking() is the unconditional seed — see its doc comment for
-  // why touch()/markInFlight() further down (in dispatchTracked) are
-  // deliberately guarded and would no-op here without this call.
-  publicSessionSweeper.beginTracking(sessionId);
-  // Best-effort touch; failure is non-fatal — pruner only deletes
-  // genuinely stale rows.
-  mcpSessionsRepository
-    .touch(sessionId)
-    .catch((error: unknown) =>
-      logger.warn(
-        `mcp_sessions touch failed for session ${sessionId}; pruner may reap prematurely.`,
-        error,
-      ),
+    logger.info(
+      `Lazy-recovered session ${sessionId} for endpoint ${stored.endpoint_name} (namespace ${stored.namespace_uuid}); persisted state restored from DB.`,
     );
-  logger.info(
-    `Lazy-recovered session ${sessionId} for endpoint ${stored.endpoint_name} (namespace ${stored.namespace_uuid}); persisted state restored from DB.`,
-  );
-  return { status: "recovered", transport };
+    return { status: "recovered", transport };
+  } finally {
+    if (!registered) {
+      await releaseFailedRecoveryInstance(sessionId, mcpServerInstance);
+    }
+  }
+}
+
+/**
+ * Give back the pool instance a lazy recovery acquired under `sessionId` when
+ * the recovery did not register its session (`server.connect` threw, or the
+ * transport could not be hydrated). Close the SDK server first, then release
+ * the backend connections through `metaMcpServerPool.cleanupSession`: that
+ * pool cleanup only releases backends, it does not close the SDK transport or
+ * run the server's onclose hook that detaches list_changed subscribers.
+ *
+ * Only when the pool still holds THIS instance under the id and no transport
+ * is resident under it: both pools are keyed by session id alone, so if
+ * another path has meanwhile taken the id over (or released it already),
+ * the entries are not this recovery's to release. Never throws, so the
+ * recovery's own outcome (its 404, or the connect error the route answers
+ * with 500) is what the caller sees.
+ */
+async function releaseFailedRecoveryInstance(
+  sessionId: string,
+  instance: MetaMcpServerInstance,
+): Promise<void> {
+  if (
+    metaMcpServerPool.getServerInstance(sessionId) !== instance ||
+    sessionManager.getSession(sessionId) !== undefined
+  ) {
+    return;
+  }
+  try {
+    // SDK connect binds its transport before awaiting start, so a failed
+    // start still needs close. Keep releasing backends if this close fails.
+    await instance.server.close();
+  } catch (error) {
+    logger.error(
+      `Failed to close SDK server after lazy recovery failed for session ${sessionId}.`,
+      error,
+    );
+  }
+  // Closing awaits and invokes onclose hooks. Recheck before releasing the
+  // id-keyed pool so a replacement installed during that await survives.
+  if (
+    metaMcpServerPool.getServerInstance(sessionId) !== instance ||
+    sessionManager.getSession(sessionId) !== undefined
+  ) {
+    return;
+  }
+  try {
+    await metaMcpServerPool.cleanupSession(sessionId);
+    logger.info(
+      `Lazy recovery for session ${sessionId} failed; released its pool instance.`,
+    );
+  } catch (error) {
+    logger.error(
+      `Lazy recovery for session ${sessionId} failed, and releasing its pool instance also failed.`,
+      error,
+    );
+  }
 }
 
 /**
@@ -1371,6 +1461,462 @@ streamableHttpRouter.get(
   },
 );
 
+/**
+ * What `prereadSessionlessPost` decided: the request was answered and nothing
+ * else may touch it, or it goes on to admission, carrying its body when the
+ * pre-read consumed it.
+ */
+type SessionlessPostPreread =
+  | { answered: true }
+  | { answered: false; parsedBody?: unknown };
+
+/**
+ * Answer a POST without an `Mcp-Session-Id` that cannot open a session,
+ * before the route admits one.
+ *
+ * WHY. Only an `initialize` opens a session, yet the new-session branch did
+ * all the work of a real one for every session-less POST: a per-credential
+ * ceiling slot (which at the ceiling can evict another idle session of the
+ * same credential), a pooled server instance, `server.connect`, the
+ * registration and the `mcp_sessions` row, all torn down again once the
+ * transport refused the request with 400. A share of claude.ai connector
+ * traffic is that request, every day, and under host CPU load each refusal
+ * took seconds and added to the load. Deciding first makes it cost one body
+ * read.
+ *
+ * HOW THE ANSWER STAYS THE SAME. The rejection is not rebuilt here. A
+ * throwaway transport that is never connected answers it from the body read
+ * here (`parsedBody`), so status, headers and JSON-RPC error come from the
+ * SDK's own `handlePostRequest` with its order of checks intact (Accept 406,
+ * Content-Type 415, batch size and message shape 400, then "Server not
+ * initialized" 400). That transport only gets a body that cannot initialize:
+ * an oversized batch is refused before any message is validated; otherwise
+ * no message is an `initialize` by the SDK's own predicate (`mayInitialize`).
+ * Its `sessionIdGenerator` throws if it ever tried. A body that may initialize
+ * goes on to admission with `parsedBody`, so it is read once.
+ * Two cases stay on the admission path:
+ *
+ *  - Accept or Content-Type the transport would refuse: it refuses them
+ *    before reading the body, so the body is left unread and the request
+ *    goes on to admission exactly as before (decided with the SDK's own
+ *    checks, on the headers as the transport sees them, see
+ *    `transportHeaderView`).
+ *  - A body found over the limit while it is read (no Content-Length; a
+ *    declared oversize never gets here, see `refuseDeclaredOversize`): the
+ *    bytes read are pushed back with `unshift` and the request goes on to
+ *    admission exactly as before, so the transport answers its own 413 and
+ *    its HTTP adapter drains the rest of the upload as it does today.
+ *
+ * A body that is not JSON, or could not be read, also gets a throwaway
+ * transport, with no parsed body: the spent or errored stream yields the
+ * SDK's own 400 -32700 "Parse error: Invalid JSON". The adapter still runs
+ * first, preserving its refusal for an invalid Host or URL too.
+ *
+ * WHAT A CALLER CAN STILL SEE CHANGE: only answers that admission itself
+ * produced. A non-initialize request from a credential at its ceiling with
+ * nothing to evict got the ceiling's 429, and one that hit a pool or connect
+ * failure got a 500; both now get the transport's 400, the answer every
+ * other non-initialize request gets. Neither could ever have opened a
+ * session.
+ *
+ * ONE ANSWER IS THE GATEWAY'S OWN: `server/discover`, the era probe of MCP
+ * revision 2026-07-28 (see `answerDiscoverAsLegacy` for why this reply).
+ */
+async function prereadSessionlessPost(
+  req: express.Request,
+  res: express.Response,
+  endpointName: string,
+): Promise<SessionlessPostPreread> {
+  const headers = transportHeaderView(req);
+  const accept = headers?.get("accept");
+  if (
+    !headers ||
+    // The SDK's Accept test as written there: a substring check on purpose.
+    !accept?.includes("application/json") ||
+    !accept.includes("text/event-stream") ||
+    !isJsonContentType(headers.get("content-type")) ||
+    // Nothing left to read: consumed already, or the client is gone.
+    req.readableEnded ||
+    req.destroyed
+  ) {
+    return { answered: false };
+  }
+
+  const read = await readBodyWithin(req, MCP_REQUEST_BODY_LIMIT_BYTES);
+  if (read.outcome === "over_limit") {
+    return { answered: false };
+  }
+  if (read.outcome === "failed") {
+    await answerWithoutSession(req, res, undefined);
+    logAnsweredWithoutSession(req, endpointName, 400, "body could not be read");
+    return { answered: true };
+  }
+  let body: unknown;
+  try {
+    // Decoded as the SDK decodes it: UTF-8, lenient, leading BOM dropped.
+    body = JSON.parse(new TextDecoder().decode(read.bytes));
+  } catch {
+    await answerWithoutSession(req, res, undefined);
+    logAnsweredWithoutSession(req, endpointName, 400, "body is not JSON");
+    return { answered: true };
+  }
+
+  if (mayInitialize(body)) {
+    return { answered: false, parsedBody: body };
+  }
+  const discover = discoverRequest(body);
+  if (discover && adapterWouldBuildRequest(req)) {
+    answerDiscoverAsLegacy(res, discover.id);
+    logAnsweredDiscover(req, endpointName, res.statusCode);
+    return { answered: true };
+  }
+  await answerWithoutSession(req, res, body);
+  logAnsweredWithoutSession(
+    req,
+    endpointName,
+    res.statusCode,
+    `methods: ${describeJsonRpcMethods(body)}`,
+  );
+  return { answered: true };
+}
+
+/**
+ * The request headers as the SDK transport sees them. The transport reads a
+ * Web `Request` that its HTTP adapter (`@hono/node-server`) builds from
+ * `rawHeaders` (HTTP/2 pseudo-headers left out), which joins a repeated
+ * header with ", " where Node's `req.headers` keeps only the first
+ * `Content-Type`. Undefined when the headers do not make a valid `Headers`,
+ * so the caller leaves the request to the transport.
+ */
+function transportHeaderView(req: express.Request): Headers | undefined {
+  const pairs: [string, string][] = [];
+  const raw = req.rawHeaders;
+  for (let at = 0; at + 1 < raw.length; at += 2) {
+    const name = raw[at];
+    const value = raw[at + 1];
+    if (name !== undefined && value !== undefined && !name.startsWith(":")) {
+      pairs.push([name, value]);
+    }
+  }
+  try {
+    return new Headers(pairs);
+  } catch {
+    return undefined;
+  }
+}
+
+type BodyRead =
+  | { outcome: "complete"; bytes: Buffer }
+  | { outcome: "over_limit" }
+  | { outcome: "failed" };
+
+/**
+ * Read a request body of at most `limit` bytes, counting as the SDK's
+ * `readRequestBody` counts (refused once more than `limit` have arrived).
+ * Over the limit, reading stops and every byte read is pushed back onto the
+ * stream with `unshift`, so the transport can read the body from the start
+ * and answer it as it always has. `failed` is a stream error or a client
+ * that went away before the end.
+ */
+function readBodyWithin(
+  req: express.Request,
+  limit: number,
+): Promise<BodyRead> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    const settle = (result: BodyRead) => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onFailed);
+      req.off("close", onClose);
+      resolve(result);
+    };
+    const onData = (chunk: Buffer) => {
+      chunks.push(chunk);
+      received += chunk.length;
+      if (received > limit) {
+        // Paused before the listener goes, so nothing more flows past it.
+        req.pause();
+        settle({ outcome: "over_limit" });
+        req.unshift(Buffer.concat(chunks));
+      }
+    };
+    const onEnd = () =>
+      settle({ outcome: "complete", bytes: Buffer.concat(chunks) });
+    const onFailed = () => settle({ outcome: "failed" });
+    // A normal end settles first, so a close seen here came before the end.
+    const onClose = () => settle({ outcome: "failed" });
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onFailed);
+    req.on("close", onClose);
+  });
+}
+
+/**
+ * Whether the transport could take this body as an initialization: a message
+ * in it is an `initialize` by the SDK's own predicate, applied as
+ * `handlePostRequest` applies it (to each message parsed with
+ * `JSONRPCMessageSchema`, batches included) and, as a margin, to each raw
+ * message too. An oversized batch cannot initialize because the SDK refuses
+ * it before checking messages. Only a body for which this is false is
+ * answered without a session.
+ */
+function mayInitialize(body: unknown): boolean {
+  // The SDK refuses an oversized batch before validating any message. Keep
+  // that bound here too: otherwise a few kilobytes of tiny invalid messages
+  // can spend seconds in schema validation before reaching its cheap refusal.
+  if (Array.isArray(body) && body.length > MAX_BATCH_SIZE) return false;
+  const messages: unknown[] = Array.isArray(body) ? body : [body];
+  return messages.some((message) => {
+    if (isInitializeRequest(message)) return true;
+    const parsed = JSONRPCMessageSchema.safeParse(message);
+    return parsed.success && isInitializeRequest(parsed.data);
+  });
+}
+
+/**
+ * Let the SDK answer a session-less request that cannot initialize, on a
+ * transport that is never connected, registered or persisted: it gives the
+ * answer the route's own transport gave ("Server not initialized", or an
+ * earlier check's refusal) and allocates nothing. It holds no stream once it
+ * has answered, so it is left to the garbage collector. With no parsed body,
+ * the spent or errored request stream yields its own parse-error response,
+ * after the adapter's URL and header checks have run.
+ */
+async function answerWithoutSession(
+  req: express.Request,
+  res: express.Response,
+  parsedBody: unknown,
+): Promise<void> {
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
+  const transport = new StreamableHTTPServerTransport({
+    // Called only to initialize, which `mayInitialize` rules out for every
+    // body this transport is given. Should a later SDK initialize anyway,
+    // throwing turns it into the SDK's 400 rather than a 200 stream that no
+    // server would ever answer.
+    sessionIdGenerator: () => {
+      logger.error(
+        "A session-less request answered without a session reached initialization; refusing it.",
+      );
+      throw new Error("Not an initialization request");
+    },
+    // Unused with a parsed body; set so every transport this gateway builds
+    // carries the same limit (see lib/metamcp/mcp-request-body-limit).
+    maxRequestBodySize: MCP_REQUEST_BODY_LIMIT_BYTES,
+  });
+  await transport.handleRequest(req, res, parsedBody);
+}
+
+/** The method MCP revision 2026-07-28 clients probe a server's era with. */
+const DISCOVER_METHOD = "server/discover";
+
+/**
+ * The reply's message names the versions this gateway negotiates, the SDK's
+ * own list that `Server` answers `initialize` from, so a client that can only
+ * surface the message still tells its user what to use.
+ */
+const DISCOVER_NOT_FOUND_MESSAGE =
+  `Method not found: ${DISCOVER_METHOD}. This server speaks MCP ` +
+  `${SUPPORTED_PROTOCOL_VERSIONS.join(", ")} and opens a session with initialize.`;
+
+/**
+ * The id of the body when it is a single `server/discover` request, parsed
+ * with the schema `handlePostRequest` parses messages with. Anything else
+ * keeps the transport's own answer: a batch (revision 2026-07-28 sends none),
+ * a notification, or a message the SDK would refuse as malformed.
+ */
+function discoverRequest(body: unknown): { id: RequestId } | undefined {
+  if (Array.isArray(body)) return undefined;
+  const parsed = JSONRPCMessageSchema.safeParse(body);
+  if (!parsed.success || !isJSONRPCRequest(parsed.data)) return undefined;
+  return parsed.data.method === DISCOVER_METHOD
+    ? { id: parsed.data.id }
+    : undefined;
+}
+
+/**
+ * Whether the SDK transport's HTTP adapter (`@hono/node-server`, `newRequest`)
+ * would build a request from this one. It refuses one whose absolute target
+ * does not parse, or whose Host header is missing or does not make a URL with
+ * that host name, with a bodiless 400 before the transport reads anything.
+ * The discover answer is written here, not through the adapter, so such a
+ * request is left to the transport to keep that refusal. The route's tests
+ * compare both cases with a bare SDK transport, so an adapter change shows.
+ */
+function adapterWouldBuildRequest(req: express.Request): boolean {
+  const target = req.url ?? "";
+  if (target.startsWith("http://") || target.startsWith("https://")) {
+    return URL.canParse(target);
+  }
+  const host = req.headers.host;
+  if (!host) return false;
+  try {
+    const url = new URL(`http://${host}${target}`);
+    return (
+      url.hostname.length === host.length ||
+      url.hostname === host.replace(/:\d+$/, "")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Answer a session-less `server/discover` with `400 {-32601 Method not
+ * found}` and the request's id, without a transport or a session.
+ *
+ * WHY. Claude Code (2.1.309 and later) opens every HTTP server with this
+ * probe, carrying `MCP-Protocol-Version: 2026-07-28`. The gateway serves only
+ * the session era (SDK 1.32.0 negotiates up to 2025-11-25 through
+ * `initialize`), so the answer has to say "legacy, use initialize", and
+ * nothing else. Specification revision 2026-07-28 makes `server/discover` a
+ * method every modern server MUST implement, so method-not-found on it can
+ * only mean a legacy server: SEP-2575 tells the client to fall back to
+ * `initialize` on it, and the stdio binding names `-32601` as the usual
+ * legacy answer. The TypeScript (2.4.0), Python, Go and Rust (rmcp 3.9.0)
+ * SDK clients and Claude Code 2.1.319's bundled client all fall back on it
+ * (source read 2026-11-07). The SDK's generic "Server not initialized" did
+ * the same job, but says nothing about the method; this answer is the true
+ * one, and its own log line separates the probes from requests that really
+ * lost their session.
+ *
+ * WHY NOT A DiscoverResult LISTING THE LEGACY VERSIONS, or an
+ * UnsupportedProtocolVersionError (-32022) whose `supported` list holds only
+ * them. The specification reads both as a modern server ("the server is
+ * modern ... Do not fall back to initialize", stdio Backward Compatibility;
+ * "retry using the advertised supported versions ... rather than falling
+ * back", Streamable HTTP Backward Compatibility). The Rust SDK's client
+ * (rmcp 3.9.0, `discover_startup`) follows that and fails the connect with
+ * `NoCompatibleProtocolVersion` on either one, where it falls back on a
+ * -32601 or on the SDK's generic 400. A reply that some clients read as
+ * modern can break every connector at once.
+ *
+ * WHY 400, NOT 404. Revision 2025-11-25, the one this gateway serves, says a
+ * server that requires a session SHOULD answer a session-less request other
+ * than `initialize` with 400, the status these probes have always had. 404
+ * with -32601 is the 2026-07-28 answer for an unknown method on a modern
+ * server, and a 4xx is where every client's fallback is most lenient (a 2xx
+ * reply the TypeScript client cannot use is a connect error, not a fallback).
+ *
+ * WHAT IT DOES NOT SAVE. The probe is itself the extra round trip; no reply
+ * removes it. Claude Code 2.1.319 remembers era verdicts for stdio and
+ * claude.ai-proxied servers, not for a plain HTTP server like this one, so it
+ * probes on every connect whatever the answer.
+ */
+function answerDiscoverAsLegacy(res: express.Response, id: RequestId): void {
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code: ErrorCode.MethodNotFound,
+      message: DISCOVER_NOT_FOUND_MESSAGE,
+    },
+  });
+  // The headers the SDK's own JSON error answers carry.
+  res.writeHead(400, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+/** A method name logged as sent; anything else is replaced. */
+const LOGGABLE_METHOD = /^[A-Za-z0-9_$./:-]{1,100}$/;
+/** Distinct method labels named in one line; the rest are counted. */
+const MAX_LOGGED_METHODS = 10;
+
+/**
+ * One INFO line per session-less request answered without a session, saying
+ * what it asked for, so the logs show what these requests are. Method names
+ * only, and only from a conservative character set so a body cannot forge log
+ * lines; never params, ids, a session id or anything from the credential.
+ * The `Mcp-Protocol-Version` header tells a client that believes it has
+ * already initialized (it sends one) from one that has not.
+ */
+function logAnsweredWithoutSession(
+  req: express.Request,
+  endpointName: string,
+  status: number,
+  what: string,
+): void {
+  logger.info(
+    `Public endpoint ${endpointName}: answered a POST without an Mcp-Session-Id ` +
+      `(HTTP ${status}) without opening a session; ${what}; ` +
+      `Mcp-Protocol-Version: ${protocolVersionLabel(req)}.`,
+  );
+}
+
+/**
+ * The one INFO line for a `server/discover` answered as a legacy server, in
+ * place of the line above: these probes arrive on every client connect, so a
+ * line of their own keeps them apart from requests that really lost or never
+ * had a session. Same rules: no params, ids or credential material.
+ */
+function logAnsweredDiscover(
+  req: express.Request,
+  endpointName: string,
+  status: number,
+): void {
+  logger.info(
+    `Public endpoint ${endpointName}: answered ${DISCOVER_METHOD} as a ` +
+      `session-era server (HTTP ${status}, JSON-RPC ${ErrorCode.MethodNotFound}) ` +
+      `without opening a session; Mcp-Protocol-Version: ` +
+      `${protocolVersionLabel(req)}.`,
+  );
+}
+
+/** The request's `Mcp-Protocol-Version`, only when it looks like a version. */
+function protocolVersionLabel(req: express.Request): string {
+  const version = req.headers["mcp-protocol-version"];
+  return version === undefined
+    ? "absent"
+    : typeof version === "string" && /^[A-Za-z0-9.-]{1,32}$/.test(version)
+      ? version
+      : "(unloggable)";
+}
+
+/** `tools/list`, or `batch of 3: tools/list, ping x2` for a batch. */
+function describeJsonRpcMethods(body: unknown): string {
+  // Match the SDK's cheap batch refusal in logging too: never walk an
+  // unbounded number of messages just to summarize a rejected request.
+  if (Array.isArray(body) && body.length > MAX_BATCH_SIZE) {
+    return `batch of ${body.length}: (over SDK batch limit)`;
+  }
+  const messages: unknown[] = Array.isArray(body) ? body : [body];
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    const label = jsonRpcMethodLabel(message);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const labels = [...counts].map(([label, count]) =>
+    count > 1 ? `${label} x${count}` : label,
+  );
+  const named = labels.slice(0, MAX_LOGGED_METHODS).join(", ");
+  const rest =
+    labels.length > MAX_LOGGED_METHODS
+      ? ` and ${labels.length - MAX_LOGGED_METHODS} more`
+      : "";
+  return Array.isArray(body)
+    ? `batch of ${messages.length}: ${named || "(empty)"}${rest}`
+    : `${named}${rest}`;
+}
+
+function jsonRpcMethodLabel(message: unknown): string {
+  if (typeof message === "object" && message !== null) {
+    const { method } = message as { method?: unknown };
+    if (typeof method === "string") {
+      return LOGGABLE_METHOD.test(method) ? method : "(unloggable method name)";
+    }
+    if ("result" in message || "error" in message) {
+      return "(response)";
+    }
+  }
+  return "(not a JSON-RPC message)";
+}
+
 streamableHttpRouter.post(
   "/:endpoint_name/mcp",
   lookupEndpoint,
@@ -1396,19 +1942,44 @@ streamableHttpRouter.post(
     const clientIdentity = await resolveClientIdentity(authReq);
 
     if (!sessionId) {
+      // Only an `initialize` can open a session. Anything else is answered
+      // here, before a ceiling slot, a pooled instance, a registration or a
+      // row is taken (see `prereadSessionlessPost`); an initialize goes on
+      // with the body that was read for the decision.
+      let parsedBody: unknown;
+      try {
+        const preread = await prereadSessionlessPost(req, res, endpointName);
+        if (preread.answered) return;
+        parsedBody = preread.parsedBody;
+      } catch (error) {
+        logger.error("Error in public endpoint /mcp POST route:", error);
+        return next(error);
+      }
+
       // Enabled admissions reserve a slot until registration, whether they
       // evict or use free capacity. Release on failure and disconnection too;
       // a late pool result must not resurrect an abandoned admission.
       let admissionEviction: CeilingEviction | undefined;
       let releaseAdmission: (() => void) | undefined;
       let initializingSessionId: string | undefined;
+      let initializingTransport: StreamableHTTPServerTransport | undefined;
       let admissionClosed = false;
       let admissionCleanup: Promise<void> | undefined;
       const cleanupAdmission = (id: string): Promise<void> => {
         if (admissionCleanup) return admissionCleanup;
         // This fresh initialize failed or lost its caller. Drop its count
         // before a potentially slow close, and tear down only once.
-        const transport = sessionManager.getSession(id);
+        const resident = sessionManager.getSession(id);
+        // A recovery may have replaced this admission while it was awaiting
+        // connect or dispatch. Its transport and id-keyed pools are its own.
+        if (
+          initializingTransport &&
+          resident &&
+          resident !== initializingTransport
+        ) {
+          return Promise.resolve();
+        }
+        const transport = initializingTransport ?? resident;
         sessionManager.removeSession(id);
         publicSessionSweeper.forget(id);
         admissionCleanup = cleanupSession(id, transport).catch(() => {
@@ -1546,6 +2117,7 @@ streamableHttpRouter.post(
             }
           },
         });
+        initializingTransport = transport;
 
         // Note: Cleanup is handled explicitly via DELETE requests
         // StreamableHTTP is designed to persist across multiple requests
@@ -1638,15 +2210,19 @@ streamableHttpRouter.post(
           res,
           newSessionId,
           clientIdentity?.name,
+          parsedBody,
         );
 
-        // The transport answered without initializing the session: a body
-        // over the limit found while reading it (a declared oversize never
-        // gets here, see refuseDeclaredOversize), invalid JSON, or a first
-        // request that is not an `initialize`. No session id went out, so
-        // nothing can reach this session again; release everything admitted
-        // above (slot, registration, idle tracking, pooled instance, row)
-        // rather than leave it to the idle sweeper or an eviction.
+        // The transport answered without initializing the session. Most
+        // requests that cannot open one are answered before admission (see
+        // `prereadSessionlessPost`); what still gets here is an Accept or
+        // Content-Type the transport refuses, a body over the limit found
+        // while reading it (a declared oversize never gets here, see
+        // refuseDeclaredOversize), and a batch holding an `initialize` with
+        // other messages. No session id went out, so nothing can reach this
+        // session again; release everything admitted above (slot,
+        // registration, idle tracking, pooled instance, row) rather than
+        // leave it to the idle sweeper or an eviction.
         if (transport.sessionId === undefined) {
           logger.info(
             `Public endpoint session ${newSessionId} was not initialized (HTTP ${res.statusCode}); releasing it.`,
@@ -1654,7 +2230,20 @@ streamableHttpRouter.post(
           await cleanupAdmission(newSessionId);
         }
       } catch (error) {
-        if (releaseAdmission && initializingSessionId && !admissionClosed) {
+        // Release an initialize that failed before giving the client its
+        // session, whether or not the per-credential ceiling admitted it. The
+        // guard used to require `releaseAdmission`, which exists only when
+        // the ceiling and its eviction are on, so with the ceiling off (or
+        // for a credential it does not count) a throw during connect or
+        // dispatch left the registration, the pooled instance and the
+        // `mcp_sessions` row behind for the idle sweeper.
+        // Once an initialized transport's response started, its id belongs
+        // to the client. A later dispatch throw must leave that live session
+        // available for subsequent requests and DELETE, as the Inspector does.
+        // `!admissionClosed`: a disconnect already started this cleanup.
+        const answeredInitialize =
+          initializingTransport?.sessionId !== undefined && res.headersSent;
+        if (initializingSessionId && !admissionClosed && !answeredInitialize) {
           await cleanupAdmission(initializingSessionId);
         }
         logger.error("Error in public endpoint /mcp POST route:", error);

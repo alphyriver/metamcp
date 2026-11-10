@@ -3,7 +3,9 @@ import helmet from "helmet";
 
 import { logBasicAuthEnforcementState } from "./auth";
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
+import { convergeConfiguredAdmins } from "./lib/admin-converge";
 import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
+import { warnIfApiKeyIpPolicyDisabled } from "./lib/api-key-ip-policy";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
 import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import { globalBodyParser } from "./lib/global-body-parser";
@@ -16,6 +18,7 @@ import { initializeRetiredTools } from "./lib/metamcp/retired-tools";
 import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
+import { assertVerifiedCallerConfig } from "./lib/metamcp/verified-caller";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import { auditContextMiddleware } from "./middleware/audit-context.middleware";
 import { authSigninRateLimitMiddleware } from "./middleware/auth-signin-rate-limit.middleware";
@@ -27,6 +30,15 @@ import oauthRouter from "./routers/oauth";
 import publicEndpointsRouter from "./routers/public-metamcp";
 import trpcRouter from "./routers/trpc";
 import logger from "./utils/logger";
+
+// Refuse to start when one backend is named in both VERIFIED_CALLER_SERVER_NAMES
+// and M365_INJECTED_SERVER_NAMES: that backend would have two writers for its
+// X-Umbrella-User-Id, the header it trusts to say who is calling. At module
+// scope, before any route is registered, so the throw exits the process with
+// the reason instead of reaching start(), whose catch only logs. Logs which
+// backends receive the verified caller when any are named. See
+// ./lib/metamcp/verified-caller.
+assertVerifiedCallerConfig();
 
 const app = express();
 
@@ -127,6 +139,20 @@ async function start(): Promise<void> {
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
 
+  // Promote the accounts METAMCP_ADMIN_EMAIL names, then warn if the gateway
+  // still has no administrator (fork issue #196). AFTER bootstrap, so an
+  // account BOOTSTRAP_USERS created on this boot can be promoted on this boot;
+  // BEFORE listening, so no request is served under the pre-converge roles.
+  // Independent of BOOTSTRAP_ENABLE on purpose: an install that never used
+  // bootstrap is exactly the one #196 left with zero admins. Unset variable =
+  // no writes. The helper logs and swallows its own failures; this guard is
+  // defence-in-depth so a future throw cannot stop the gateway starting.
+  try {
+    await convergeConfiguredAdmins();
+  } catch (err) {
+    logger.error("Admin converge: unexpected error (ignored):", err);
+  }
+
   // Encrypt any legacy plaintext mcp_servers.bearer_token once, then arm the
   // read path's fail-closed rule. Sequenced AFTER
   // the 0036 migration (applied before start()) and BEFORE the idle pool warms
@@ -203,6 +229,12 @@ async function start(): Promise<void> {
   // been switched off with ADMIN_PLANE_TOKEN_AUTH_DISABLED=true (migration
   // 0038), so an emergency disable is legible in the boot log.
   warnIfAdminPlaneTokenAuthDisabled();
+
+  // One boot-time signal when API-key IP allowlists are switched off with
+  // API_KEY_IP_POLICY_DISABLED=true (migration 0041), so an emergency disable
+  // is legible in the boot log rather than discovered when a policy that
+  // looks enforced is not.
+  warnIfApiKeyIpPolicyDisabled();
 
   // One boot-time signal for the effective DISABLE_BASIC_AUTH state, so the
   // boot log records whether password login is on. Reads the DB-backed setting,

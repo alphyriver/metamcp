@@ -49,17 +49,36 @@ jobs:
           git config user.name "alphyriver sync bot"
           git config user.email "actions@github.com"
           if ! git merge --no-ff "$upstream" -m "chore(sync): merge Umbrella upstream"; then
-            git merge --abort
-            existing="$(gh pr list --base umbrella --head Umbrella-IT-Group:umbrella --state open --json number --jq ".[0].number" || true)"
-            if [ -z "$existing" ]; then
-              gh pr create \
-                --base umbrella \
-                --head Umbrella-IT-Group:umbrella \
-                --title "chore(sync): reconcile Umbrella upstream" \
-                --body "The weekly sync detected merge conflicts. Resolve this PR against umbrella; the sync workflow will resume after merge."
+            # Files the fork deleted on purpose (.github/sync-keep-deleted.txt)
+            # stay deleted: a modify/delete conflict on exactly those paths is
+            # resolved here. Anything else is a real conflict for a human.
+            keep_deleted="$(grep -v '^[[:space:]]*\(#\|$\)' .github/sync-keep-deleted.txt 2>/dev/null || true)"
+            while IFS= read -r line; do
+              status="${line:0:2}"; path="${line:3}"
+              if [ "$status" = "DU" ] && grep -Fxq -- "$path" <<<"$keep_deleted"; then
+                git rm --quiet -- "$path"
+                echo "Kept deleted (sync-keep-deleted.txt): $path" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done < <(git status --porcelain)
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [ -n "$conflicts" ]; then
+              git merge --abort
+              # A reconciliation PR from a branch this fork owns, so the
+              # conflicts can be resolved on it (merge umbrella into it). A PR
+              # straight from Umbrella-IT-Group:umbrella could never be fixed here.
+              git push --force origin "$upstream:refs/heads/automation/reconcile-umbrella"
+              body="$(printf 'The weekly sync could not merge Umbrella-IT-Group/metamcp@%s.\n\nConflicting paths:\n%s\n\nResolve on this branch: `git fetch origin && git switch automation/reconcile-umbrella && git merge origin/umbrella`, fix the conflicts, push. A path the fork deleted on purpose belongs in `.github/sync-keep-deleted.txt`, so the next sync keeps it deleted on its own.' "$upstream" "$(sed 's/^/- `/; s/$/`/' <<<"$conflicts")")"
+              existing="$(gh pr list --base umbrella --head automation/reconcile-umbrella --state open --json number --jq '.[0].number // empty')"
+              if [ -z "$existing" ]; then
+                gh pr create --base umbrella --head automation/reconcile-umbrella \
+                  --title "chore(sync): reconcile Umbrella upstream" --body "$body"
+              else
+                gh pr edit "$existing" --body "$body"
+              fi
+              echo "Umbrella sync has merge conflicts in: $(tr '\n' ' ' <<<"$conflicts"). Reconciliation PR is open." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
             fi
-            echo "Umbrella sync has merge conflicts; a reconciliation PR is open or was refreshed." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+            git commit --no-edit --quiet
           fi
 
           git push --force-with-lease origin HEAD:refs/heads/automation/sync-umbrella
