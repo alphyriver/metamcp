@@ -2081,6 +2081,20 @@ export class McpServerPool {
       }
     }
 
+    // Background warming is for servers a session can actually be routed to.
+    // Startup caches params for EVERY registered server, mount status
+    // regardless, and the loops below rebuild whatever is cached. A server
+    // whose only mount is INACTIVE (switched off on purpose, its backend
+    // stopped) was therefore reconnected on every sweep, forever: an HTTP
+    // connect failure never trips the ERROR gate, so nothing stopped it.
+    // Observed in production: 3 failed connects a minute to a stopped
+    // backend for days, with resident memory climbing ~80 MB/day while it
+    // lasted. null means the lookup is unavailable; warm everything then,
+    // as before, rather than starve a routable server.
+    const routable = await this.findRoutableServerUuids();
+    const isRoutable = (serverUuid: string) =>
+      routable === null || routable.has(serverUuid);
+
     const serverUuids = Object.keys(this.idleSessions);
 
     for (const serverUuid of serverUuids) {
@@ -2117,9 +2131,9 @@ export class McpServerPool {
         // Reset error state so we can retry
         await serverErrorTracker.resetServerErrorState(serverUuid);
 
-        // Recreate if we have cached params
+        // Recreate if we have cached params and a session can reach it.
         const params = this.serverParamsCache[serverUuid];
-        if (params) {
+        if (params && isRoutable(serverUuid)) {
           this.createIdleSessionAsync(serverUuid, params);
         }
       }
@@ -2130,7 +2144,8 @@ export class McpServerPool {
     for (const [serverUuid, params] of Object.entries(this.serverParamsCache)) {
       if (
         !this.idleSessions[serverUuid] &&
-        !this.creatingIdleSessions.has(serverUuid)
+        !this.creatingIdleSessions.has(serverUuid) &&
+        isRoutable(serverUuid)
       ) {
         const isError =
           await serverErrorTracker.isServerInErrorState(serverUuid);
@@ -2172,6 +2187,26 @@ export class McpServerPool {
     // hands the zombies out blind — indefinitely (the zero-tool outage).
     if (this.activeHealthCheckEnabled) {
       await this.checkActiveSessionHealth();
+    }
+  }
+
+  /**
+   * The servers mounted ACTIVE in at least one namespace, or null when that
+   * cannot be read (a transient DB error, or a unit-test repository mock
+   * without the method). Callers treat null as "every server is routable".
+   */
+  private async findRoutableServerUuids(): Promise<Set<string> | null> {
+    if (typeof mcpServersRepository.findUuidsWithActiveMount !== "function") {
+      return null;
+    }
+    try {
+      return new Set(await mcpServersRepository.findUuidsWithActiveMount());
+    } catch (error) {
+      logger.warn(
+        "Routable-server lookup failed; warming every cached server this sweep:",
+        error,
+      );
+      return null;
     }
   }
 

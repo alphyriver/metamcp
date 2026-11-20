@@ -2,6 +2,7 @@ import {
   DatabaseMcpServer,
   McpServerCreateInput,
   McpServerErrorStatusEnum,
+  McpServerStatusEnum,
   McpServerUpdateInput,
 } from "@repo/zod-types";
 import { and, desc, eq, isNotNull, isNull, like, not, or } from "drizzle-orm";
@@ -15,7 +16,7 @@ import {
 import logger from "@/utils/logger";
 
 import { db } from "../index";
-import { mcpServersTable } from "../schema";
+import { mcpServersTable, namespaceServerMappingsTable } from "../schema";
 
 // Encrypt a bearer token at the CREATE boundary. A
 // non-empty value is stored as an `enc:v1:` envelope; empty/undefined is left
@@ -128,6 +129,26 @@ export class McpServersRepository {
       .select()
       .from(mcpServersTable)
       .orderBy(desc(mcpServersTable.created_at));
+  }
+
+  /**
+   * UUIDs of the servers mounted ACTIVE in at least one namespace. Only these
+   * can be routed to: an INACTIVE mount is filtered out of every namespace
+   * listing and tool call, and a server mounted nowhere is reached by no
+   * endpoint. The pool's health sweep reads this to skip background warming
+   * of everything else.
+   */
+  async findUuidsWithActiveMount(): Promise<string[]> {
+    const rows = await db
+      .selectDistinct({ uuid: namespaceServerMappingsTable.mcp_server_uuid })
+      .from(namespaceServerMappingsTable)
+      .where(
+        eq(
+          namespaceServerMappingsTable.status,
+          McpServerStatusEnum.enum.ACTIVE,
+        ),
+      );
+    return rows.map((row) => row.uuid);
   }
 
   // Find servers accessible to a specific user (public + user's own servers)
