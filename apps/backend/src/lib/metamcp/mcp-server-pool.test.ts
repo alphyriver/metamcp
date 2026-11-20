@@ -1077,6 +1077,119 @@ describe("McpServerPool half-open ERROR-gate probe", () => {
   });
 });
 
+describe("McpServerPool health sweep skips servers no namespace routes to", () => {
+  // Startup caches params for every registered server, so a server whose
+  // only mount is INACTIVE (switched off with its backend stopped) used to
+  // be reconnected on every 60 s sweep, forever: HTTP connect failures never
+  // trip the ERROR gate. Production saw 3 failed connects a minute for days.
+
+  type SweepInternals = {
+    activeSessions: Record<string, unknown>;
+    idleSessions: Record<string, unknown>;
+    sessionToServers: Record<string, Set<string>>;
+    creatingIdleSessions: Set<string>;
+    serverParamsCache: Record<string, unknown>;
+    lastErrorProbeAt: Record<string, number>;
+    checkIdleSessionHealth: () => Promise<void>;
+  };
+
+  let pool: McpServerPool;
+  let internals: SweepInternals;
+  let createIdleSpy: ReturnType<typeof vi.fn>;
+  let repo: { findUuidsWithActiveMount?: ReturnType<typeof vi.fn> };
+
+  beforeEach(async () => {
+    pool = new PoolConstructor();
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.creatingIdleSessions = new Set();
+    internals.serverParamsCache = {
+      "server-mounted": { uuid: "server-mounted", name: "mounted" },
+      "server-inactive": { uuid: "server-inactive", name: "inactive" },
+    };
+    internals.lastErrorProbeAt = {};
+
+    const tracker = (await import("./server-error-tracker"))
+      .serverErrorTracker as never as {
+      isServerInErrorState: ReturnType<typeof vi.fn>;
+      resetServerErrorState: ReturnType<typeof vi.fn>;
+    };
+    tracker.isServerInErrorState.mockReset().mockResolvedValue(false);
+    tracker.resetServerErrorState.mockReset();
+
+    repo = (await import("../../db/repositories/mcp-servers.repo"))
+      .mcpServersRepository as never;
+    repo.findUuidsWithActiveMount = vi
+      .fn()
+      .mockResolvedValue(["server-mounted"]);
+
+    createIdleSpy = vi.fn();
+    (
+      pool as never as { createIdleSessionAsync: unknown }
+    ).createIdleSessionAsync = createIdleSpy;
+  });
+
+  afterEach(() => {
+    delete repo.findUuidsWithActiveMount;
+  });
+
+  it("warms a server mounted ACTIVE somewhere and skips one that is not", async () => {
+    await internals.checkIdleSessionHealth();
+
+    expect(createIdleSpy).toHaveBeenCalledTimes(1);
+    expect(createIdleSpy).toHaveBeenCalledWith(
+      "server-mounted",
+      internals.serverParamsCache["server-mounted"],
+    );
+  });
+
+  it("does not rebuild a dead idle session for a server with no ACTIVE mount", async () => {
+    const dead = {
+      client: { ping: vi.fn().mockRejectedValue(new Error("fetch failed")) },
+      cleanup: vi.fn().mockResolvedValue(undefined),
+    };
+    internals.idleSessions["server-inactive"] = dead;
+
+    await internals.checkIdleSessionHealth();
+
+    expect(internals.idleSessions["server-inactive"]).toBeUndefined();
+    expect(createIdleSpy).not.toHaveBeenCalledWith(
+      "server-inactive",
+      expect.anything(),
+    );
+  });
+
+  it("warms every cached server when the lookup fails", async () => {
+    repo.findUuidsWithActiveMount!.mockRejectedValue(new Error("db down"));
+
+    await internals.checkIdleSessionHealth();
+
+    expect(createIdleSpy).toHaveBeenCalledWith(
+      "server-mounted",
+      expect.anything(),
+    );
+    expect(createIdleSpy).toHaveBeenCalledWith(
+      "server-inactive",
+      expect.anything(),
+    );
+  });
+
+  it("warms the server again once its mount is ACTIVE", async () => {
+    repo.findUuidsWithActiveMount!.mockResolvedValue([]);
+    await internals.checkIdleSessionHealth();
+    expect(createIdleSpy).not.toHaveBeenCalled();
+
+    repo.findUuidsWithActiveMount!.mockResolvedValue(["server-inactive"]);
+    await internals.checkIdleSessionHealth();
+    expect(createIdleSpy).toHaveBeenCalledWith(
+      "server-inactive",
+      internals.serverParamsCache["server-inactive"],
+    );
+  });
+});
+
 describe("McpServerPool connect-failure stamp — /health/upstream truthfulness", () => {
   // HTTP/SSE backends never trip the ERROR circuit breaker (crash
   // counting is STDIO-only), so before this stamp a hard-down HTTP
